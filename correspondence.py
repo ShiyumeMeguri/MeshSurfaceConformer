@@ -1,9 +1,9 @@
-# 表面对应内核:BVH 最近点/射线查询 + 重心插值采样。
+# 表面对应内核:BVH/KD 查询 + 重心/聚合插值采样。
 # 纯数学层:只依赖 numpy 与 mathutils,不 import bpy。
 # 设计要点:
-#   1. 所有匹配都是"插值最近表面"——命中三角形 + 重心权重,绝不做最近顶点吸附
-#      (吸附只作为可选后处理,见 snap_positions_to_nearest)。
-#   2. 同一个内核同时服务 3D 空间(BVH 顶点池 = 网格顶点)与 UV 空间
+#   1. 对应关系统一表达成「每个目标元素 → K 个源元素索引 + 权重」:
+#      K=1 单点吸附(Nearest 系),K=2 边插值,K=3 面重心插值 —— 一个采样内核吃全部映射。
+#   2. 同一套内核同时服务 3D 空间(BVH 顶点池 = 网格顶点)与 UV 空间
 #      (BVH 顶点池 = 逐角点 UV 升维到 z=0),靠 triangle_vertex_indices /
 #      triangle_corner_indices 双索引把命中三角形还原到源网格的顶点域与角点域。
 #   3. UV 空间的顶点域采样必须经 CombinedVertexCorrespondence 收敛:
@@ -70,8 +70,61 @@ def compute_barycentric_weights(points, triangle_corners, clamp_inside):
     return weights
 
 
+# ==================== ragged(变长段)向量化工具 ====================
+
+def ragged_arange(counts):
+    """counts (N,) → (row_indices, within_offsets):
+    row_indices 标记每个展开元素属于哪一行,within_offsets 是行内 [0..counts[i]) 序号。"""
+    counts = np.asarray(counts, dtype=np.int64)
+    total = int(counts.sum())
+    row_indices = np.repeat(np.arange(counts.shape[0], dtype=np.int64), counts)
+    if total == 0:
+        return row_indices, np.empty(0, dtype=np.int64)
+    starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
+    within_offsets = np.arange(total, dtype=np.int64) - starts[row_indices]
+    return row_indices, within_offsets
+
+
+def segment_best_rows(segment_indices, scores, take_maximum):
+    """每段取分数最优的一行。返回 (出现过的段 id, 对应的最优行号)。
+    实现:lexsort 按 (段, 分数) 排序后取每段首行,全程向量化。"""
+    if segment_indices.shape[0] == 0:
+        empty = np.empty(0, dtype=np.int64)
+        return empty, empty
+    keys = -scores if take_maximum else scores
+    order = np.lexsort((keys, segment_indices))
+    sorted_segments = segment_indices[order]
+    first_mask = np.empty(sorted_segments.shape[0], dtype=bool)
+    first_mask[0] = True
+    first_mask[1:] = sorted_segments[1:] != sorted_segments[:-1]
+    return sorted_segments[first_mask], order[first_mask]
+
+
+# ==================== 对应关系表达 ====================
+
+class GatherCorrespondence:
+    """通用聚合对应:每行 K 个源元素索引 + 权重。
+
+    索引指向调用方传入数据数组的行,顶点域/角点域通用:
+    K=1 = 单元素吸附(Nearest Vertex / Nearest Corner 系映射),
+    K=2 = 边端点插值,K=3 及以上 = 面插值。
+    """
+
+    __slots__ = ("valid", "distances", "_indices", "_weights")
+
+    def __init__(self, indices, weights, distances, valid):
+        self._indices = indices      # (N, K) int64
+        self._weights = weights      # (N, K) float64
+        self.distances = distances   # (N,) float64
+        self.valid = valid           # (N,) bool
+
+    def sample(self, data):
+        data = np.asarray(data, dtype=np.float64)
+        return np.einsum('nkc,nk->nc', data[self._indices], self._weights)
+
+
 class CorrespondenceRows:
-    """一次查询的逐行命中结果:命中三角形 + 重心权重,可对任意源数据插值采样。"""
+    """一次三角形命中查询的逐行结果:命中三角形 + 重心权重,可对任意源数据插值采样。"""
 
     __slots__ = ("valid", "distances", "_triangle_indices", "_weights", "_owner")
 
@@ -107,7 +160,7 @@ class CorrespondenceRows:
 
 
 class SurfaceCorrespondence:
-    """源表面的查询结构:一次构建,多次查询/采样。"""
+    """源表面的三角形查询结构:一次构建,多次查询/采样。"""
 
     __slots__ = ("triangle_count", "triangle_vertex_indices", "triangle_corner_indices",
                  "_triangle_corner_positions", "_bvh_tree")
@@ -178,6 +231,62 @@ class SurfaceCorrespondence:
         corners = self._triangle_corner_positions[safe_indices]
         weights = compute_barycentric_weights(weight_points, corners, clamp_inside)
         return CorrespondenceRows(valid, safe_indices, weights, distances, self)
+
+
+class EdgeNearestQuery:
+    """边最近点查询:以退化三角形 (a, b, b) 建 BVH,find_nearest 的命中即线段最近点
+    (closest_on_tri 对退化三角形自然退化为线段最近点)。"""
+
+    __slots__ = ("edge_vertex_indices", "_bvh_tree")
+
+    def __init__(self, vertex_positions, edge_vertex_indices):
+        self.edge_vertex_indices = edge_vertex_indices  # (E, 2) int64
+        triangles = np.column_stack((
+            edge_vertex_indices[:, 0],
+            edge_vertex_indices[:, 1],
+            edge_vertex_indices[:, 1]))
+        self._bvh_tree = BVHTree.FromPolygons(
+            vertex_positions.tolist(), triangles.tolist(), all_triangles=True)
+
+    def query_nearest(self, query_points, max_distance=None):
+        """返回 (edge_indices, hit_positions, distances),未命中行 index=-1。"""
+        count = query_points.shape[0]
+        edge_indices = np.full(count, -1, dtype=np.int64)
+        hit_positions = np.zeros((count, 3), dtype=np.float64)
+        distances = np.full(count, np.inf, dtype=np.float64)
+        search_radius = float(max_distance) if max_distance is not None else _UNLIMITED_DISTANCE
+        find_nearest = self._bvh_tree.find_nearest
+        for index, point in enumerate(query_points.tolist()):
+            location, _normal, edge_index, distance = find_nearest(point, search_radius)
+            if edge_index is not None:
+                edge_indices[index] = edge_index
+                hit_positions[index] = location
+                distances[index] = distance
+        return edge_indices, hit_positions, distances
+
+
+def build_kd_tree(positions):
+    """mathutils KDTree 构建(最近顶点系映射用)。"""
+    kd_tree = KDTree(positions.shape[0])
+    insert = kd_tree.insert
+    for index, coordinate in enumerate(positions.tolist()):
+        insert(coordinate, index)
+    kd_tree.balance()
+    return kd_tree
+
+
+def query_kd_nearest(kd_tree, query_points):
+    """逐点最近邻查询。返回 (indices, distances),未命中(空树)行 index=-1。"""
+    count = query_points.shape[0]
+    indices = np.full(count, -1, dtype=np.int64)
+    distances = np.full(count, np.inf, dtype=np.float64)
+    find = kd_tree.find
+    for index, point in enumerate(query_points.tolist()):
+        _location, reference_index, distance = find(point)
+        if reference_index is not None:
+            indices[index] = reference_index
+            distances[index] = distance
+    return indices, distances
 
 
 class DirectVertexCorrespondence:
@@ -253,7 +362,7 @@ class TopologyVertexCorrespondence:
 
 
 class DirectCornerCorrespondence:
-    """逐角点(loop)查询的角点域对应。"""
+    """逐角点(loop)三角形插值查询的角点域对应。"""
 
     __slots__ = ("valid", "distances", "_rows")
 
@@ -294,11 +403,7 @@ def snap_positions_to_nearest(positions, reference_positions, valid_mask):
     """可选后处理:把采样位置吸附到最近的源顶点(旧版 Snap 功能的等价保留)。
     只处理有效命中行;返回新数组,不修改输入(修复旧版原地别名副作用)。"""
     reference = np.asarray(reference_positions, dtype=np.float64)
-    kd_tree = KDTree(reference.shape[0])
-    insert = kd_tree.insert
-    for index, coordinate in enumerate(reference.tolist()):
-        insert(coordinate, index)
-    kd_tree.balance()
+    kd_tree = build_kd_tree(reference)
     snapped = np.array(positions, dtype=np.float64, copy=True)
     find = kd_tree.find
     for index in np.nonzero(valid_mask)[0].tolist():

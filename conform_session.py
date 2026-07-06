@@ -1,6 +1,10 @@
 # 表面贴合会话:把设置解析成对应关系与影响权重,驱动全部数据类型的传输。
-# 架构:一次会话只构建一次顶点域/角点域对应关系,全部数据类型复用同一内核采样
-# (旧版每种数据各跑一遍投射,本版 O(1) 次对应 + 每类一次向量化采样)。
+# 架构:一次会话只构建一次顶点域/角点域对应关系,全部数据类型复用同一内核采样。
+# 映射方式与 Blender DataTransfer 修改器逐项对齐(标识符/命名/语义一致):
+#   顶点域: TOPOLOGY / NEAREST / EDGE_NEAREST / EDGEINTERP_NEAREST /
+#           POLY_NEAREST / POLYINTERP_NEAREST / POLYINTERP_VNORPROJ (+ 本插件独有 UV)
+#   角点域: TOPOLOGY / NEAREST_NORMAL / NEAREST_POLYNOR / NEAREST_POLY /
+#           POLYINTERP_NEAREST / POLYINTERP_LNORPROJ (+ 本插件独有 UV)
 # 影响权重统一管线:mix × 顶点组遮罩 × 选择遮罩 × 距离衰减 × 命中有效性,
 # 所有数据按 result = existing + (sampled - existing) × influence 混合落地。
 
@@ -8,6 +12,8 @@ import numpy as np
 
 from .correspondence import (
     SurfaceCorrespondence,
+    EdgeNearestQuery,
+    GatherCorrespondence,
     DirectVertexCorrespondence,
     CombinedVertexCorrespondence,
     TopologyVertexCorrespondence,
@@ -15,6 +21,10 @@ from .correspondence import (
     TopologyCornerCorrespondence,
     deduplicate_uv_queries,
     snap_positions_to_nearest,
+    build_kd_tree,
+    query_kd_nearest,
+    ragged_arange,
+    segment_best_rows,
 )
 from .mesh_buffers import (
     MeshBufferSnapshot,
@@ -37,23 +47,27 @@ from .mesh_buffers import (
 )
 from .shape_key_drivers import transfer_shape_key_drivers
 
+# 与目标几何无关的映射(可在 Shape 写回后惰性构建)。
+_POSITION_INDEPENDENT_MAPPINGS = {'TOPOLOGY', 'UV'}
+
 
 class ConformError(RuntimeError):
     """配置或数据不满足传输前提时抛出,由算子层转成 report。"""
 
 
 class ConformSession:
-    def __init__(self, context, settings, target_object):
+    def __init__(self, context, settings, source_object, target_object):
         self._context = context
         self.settings = settings
+        self.source_object = source_object
         self.target_object = target_object
 
-        source_object = settings.source_object
         if source_object is None or source_object.type != 'MESH':
-            raise ConformError("Pick a mesh object as the source")
+            raise ConformError("Source must be a mesh object")
+        if target_object is None or target_object.type != 'MESH':
+            raise ConformError("Target must be a mesh object")
         if source_object == target_object:
             raise ConformError("Source and target are the same object")
-        self.source_object = source_object
 
         depsgraph = context.evaluated_depsgraph_get() if settings.use_evaluated_source else None
         self.source_snapshot = MeshBufferSnapshot(
@@ -62,8 +76,6 @@ class ConformSession:
 
         if self.target_snapshot.vertex_count == 0:
             raise ConformError("Target mesh has no vertices")
-        if settings.matching_domain != 'TOPOLOGY' and len(self.source_snapshot.mesh.polygons) == 0:
-            raise ConformError("Source mesh has no faces to sample")
 
         self._source_matrix = matrix_to_numpy(source_object.matrix_world)
         self._target_matrix = matrix_to_numpy(target_object.matrix_world)
@@ -77,8 +89,7 @@ class ConformSession:
         else:
             self._position_matrix = np.identity(4, dtype=np.float64)
 
-        self._surface_3d = None
-        self._uv_surface = None
+        self._match_cache = {}
         self._vertex_correspondence = None
         self._corner_correspondence = None
         self._vertex_influence_base = None
@@ -90,7 +101,7 @@ class ConformSession:
         self.source_snapshot.free()
         self.target_snapshot.free()
 
-    # ==================== 对应关系构建 ====================
+    # ==================== 匹配空间几何 ====================
 
     def _is_world_space(self):
         return self.settings.transform_space == 'WORLD'
@@ -98,24 +109,73 @@ class ConformSession:
     def _search_max_distance(self):
         return self.settings.max_distance if self.settings.use_max_distance else None
 
-    def _get_surface_3d(self):
-        """源表面 3D BVH。WORLD 模式在世界空间建树,距离阈值即世界单位。"""
-        if self._surface_3d is None:
-            source = self.source_snapshot
-            positions = source.vertex_positions
+    def _cached_match(self, key, builder):
+        value = self._match_cache.get(key)
+        if value is None:
+            value = builder()
+            self._match_cache[key] = value
+        return value
+
+    def _get_source_match_positions(self):
+        def build():
+            positions = self.source_snapshot.vertex_positions
             if self._is_world_space():
                 positions = transform_points(positions, self._source_matrix)
-            self._surface_3d = SurfaceCorrespondence(
-                positions,
+            return positions
+        return self._cached_match("source_positions", build)
+
+    def _get_target_match_positions(self):
+        def build():
+            positions = self.target_snapshot.vertex_positions
+            if self._is_world_space():
+                positions = transform_points(positions, self._target_matrix)
+            return positions
+        return self._cached_match("target_positions", build)
+
+    def _match_space_source_normals(self, normals):
+        if not self._is_world_space():
+            return normals
+        inverse_transpose = np.linalg.inv(self._source_matrix[:3, :3]).T
+        return normalized_rows(transform_directions(normals, inverse_transpose))
+
+    def _match_space_target_normals(self, normals):
+        if not self._is_world_space():
+            return normals
+        inverse_transpose = np.linalg.inv(self._target_matrix[:3, :3]).T
+        return normalized_rows(transform_directions(normals, inverse_transpose))
+
+    def _get_surface_3d(self):
+        """源表面 3D BVH。WORLD 模式在世界空间建树,距离阈值即世界单位。"""
+        def build():
+            source = self.source_snapshot
+            if len(source.mesh.polygons) == 0:
+                raise ConformError("Source mesh has no faces for face mapping")
+            return SurfaceCorrespondence(
+                self._get_source_match_positions(),
                 source.triangle_vertex_indices,
                 source.triangle_vertex_indices,
                 source.triangle_loop_indices)
-        return self._surface_3d
+        return self._cached_match("surface_3d", build)
+
+    def _get_edge_query(self):
+        def build():
+            edges = self.source_snapshot.edge_vertex_indices
+            if edges.shape[0] == 0:
+                raise ConformError("Source mesh has no edges for edge mapping")
+            return EdgeNearestQuery(self._get_source_match_positions(), edges)
+        return self._cached_match("edge_query", build)
+
+    def _get_source_vertex_kd(self):
+        def build():
+            if self.source_snapshot.vertex_count == 0:
+                raise ConformError("Source mesh has no vertices")
+            return build_kd_tree(self._get_source_match_positions())
+        return self._cached_match("source_kd", build)
 
     def _get_uv_surface(self):
         """源 UV 空间 BVH:逐角点 UV 升维到 z=0,三角形即 loop 三角形。
         剔除零面积退化三角形(未展开面),避免查询被吸到 (0, 0)。"""
-        if self._uv_surface is None:
+        def build():
             source = self.source_snapshot
             layer_name = self.settings.uv_match_layer_source or source.active_uv_layer_name
             if not layer_name:
@@ -124,9 +184,11 @@ class ConformSession:
             if uv_coordinates is None:
                 raise ConformError(
                     f"Source UV layer '{layer_name}' not found for UV matching")
+            triangle_loops = source.triangle_loop_indices
+            if triangle_loops.shape[0] == 0:
+                raise ConformError("Source mesh has no faces for UV matching")
             positions = np.zeros((uv_coordinates.shape[0], 3), dtype=np.float64)
             positions[:, :2] = uv_coordinates
-            triangle_loops = source.triangle_loop_indices
             corner_uv = uv_coordinates[triangle_loops]
             edge_one = corner_uv[:, 1] - corner_uv[:, 0]
             edge_two = corner_uv[:, 2] - corner_uv[:, 0]
@@ -136,26 +198,12 @@ class ConformSession:
             if not np.any(keep):
                 raise ConformError(
                     f"Source UV layer '{layer_name}' is fully degenerate (zero area)")
-            self._uv_surface = SurfaceCorrespondence(
+            return SurfaceCorrespondence(
                 positions,
                 triangle_loops[keep],
                 source.triangle_vertex_indices[keep],
                 triangle_loops[keep])
-        return self._uv_surface
-
-    def _target_vertex_query_points(self):
-        positions = self.target_snapshot.vertex_positions
-        if self._is_world_space():
-            positions = transform_points(positions, self._target_matrix)
-        return positions
-
-    def _target_vertex_query_normals(self):
-        normals = self.target_snapshot.vertex_normals
-        if self._is_world_space():
-            # 法线按位置矩阵的逆转置变换(非均匀缩放安全)。
-            inverse_transpose = np.linalg.inv(self._target_matrix[:3, :3]).T
-            normals = normalized_rows(transform_directions(normals, inverse_transpose))
-        return normals
+        return self._cached_match("uv_surface", build)
 
     def _read_target_match_uv(self):
         target = self.target_snapshot
@@ -167,52 +215,39 @@ class ConformSession:
             raise ConformError(f"Target UV layer '{layer_name}' not found for UV matching")
         return uv_coordinates
 
+    def _corner_query_geometry(self):
+        """(导向偏置查询点, 真实角点位置),都在匹配空间。
+        偏置:角点向所属面中心偏移一点决定命中面,接缝两侧各落到正确一侧;
+        重心权重再用真实角点无钳计算,边界处线性外推不内缩。"""
+        target = self.target_snapshot
+        corner_positions = target.vertex_positions[target.loop_vertex_indices]
+        nudged = corner_positions + (
+            target.corner_face_centers - corner_positions) * self.settings.corner_sampling_bias
+        if self._is_world_space():
+            nudged = transform_points(nudged, self._target_matrix)
+            corner_positions = transform_points(corner_positions, self._target_matrix)
+        return nudged, corner_positions
+
+    # ==================== 顶点域对应(Blender 顶点映射全集) ====================
+
     def get_vertex_correspondence(self):
-        """顶点域对应(形状/形态键/顶点组/点域颜色共用)。"""
         if self._vertex_correspondence is not None:
             return self._vertex_correspondence
-        settings = self.settings
+        mapping = self.settings.vertex_mapping
         target = self.target_snapshot
-        domain = settings.matching_domain
-        if domain == 'TOPOLOGY':
-            source_count = self.source_snapshot.vertex_count
-            if source_count != target.vertex_count:
-                raise ConformError(
-                    f"Topology matching needs equal vertex counts "
-                    f"(source {source_count:,}, target {target.vertex_count:,})")
-            correspondence = TopologyVertexCorrespondence(target.vertex_count)
-        elif domain == 'UV':
-            if target.loop_count == 0:
-                raise ConformError("Target mesh has no face corners for UV matching")
-            target_uv = self._read_target_match_uv()
-            first_indices, inverse_indices = deduplicate_uv_queries(target_uv)
-            queries = np.zeros((first_indices.shape[0], 3), dtype=np.float64)
-            queries[:, :2] = target_uv[first_indices]
-            surface = self._get_uv_surface()
-            triangle_indices, hit_positions, distances = surface.query_nearest(
-                queries, self._search_max_distance())
-            # 顶点域权重用命中点 + 内钳:采样结果必须落在源面上。
-            rows = surface.resolve(
-                triangle_indices, hit_positions, distances, clamp_inside=True)
-            correspondence = CombinedVertexCorrespondence(
-                rows.expand(inverse_indices),
-                target.loop_vertex_indices,
-                target.vertex_count)
+        if mapping == 'TOPOLOGY':
+            correspondence = self._build_vertex_topology()
+        elif mapping == 'UV':
+            correspondence = self._build_vertex_uv()
+        elif mapping == 'NEAREST':
+            correspondence = self._build_vertex_nearest()
+        elif mapping in {'EDGE_NEAREST', 'EDGEINTERP_NEAREST'}:
+            correspondence = self._build_vertex_edge(mapping)
+        elif mapping == 'POLY_NEAREST':
+            correspondence = self._build_vertex_nearest_face_vertex()
         else:
-            surface = self._get_surface_3d()
-            points = self._target_vertex_query_points()
-            if settings.surface_method == 'PROJECT':
-                directions = self._target_vertex_query_normals()
-                triangle_indices, hit_positions, distances = surface.query_ray(
-                    points, directions,
-                    self.settings.project_max_distance or None,
-                    settings.project_bidirectional)
-            else:
-                triangle_indices, hit_positions, distances = surface.query_nearest(
-                    points, self._search_max_distance())
-            rows = surface.resolve(
-                triangle_indices, hit_positions, distances, clamp_inside=True)
-            correspondence = DirectVertexCorrespondence(rows)
+            # POLYINTERP_NEAREST / POLYINTERP_VNORPROJ:面重心插值(最近点 / 法线投射)。
+            correspondence = self._build_vertex_face_interpolated(mapping)
         unmatched = int(np.count_nonzero(~correspondence.valid))
         if unmatched:
             self.warnings.append(
@@ -221,58 +256,138 @@ class ConformSession:
         self._vertex_correspondence = correspondence
         return correspondence
 
-    def get_corner_correspondence(self):
-        """角点域对应(UV/角域颜色/自定义法线共用)。
+    def _build_vertex_topology(self):
+        source_count = self.source_snapshot.vertex_count
+        target_count = self.target_snapshot.vertex_count
+        if source_count != target_count:
+            raise ConformError(
+                f"Topology mapping needs equal vertex counts "
+                f"(source {source_count:,}, target {target_count:,})")
+        return TopologyVertexCorrespondence(target_count)
 
-        3D 匹配用"导向偏置"查询:角点向所属面中心偏移一点决定命中面
-        (接缝两侧的角点各落到正确一侧),重心权重再用真实角点无钳计算
-        (边界处线性外推,UV 不内缩)。
-        """
+    def _build_vertex_uv(self):
+        target = self.target_snapshot
+        if target.loop_count == 0:
+            raise ConformError("Target mesh has no face corners for UV matching")
+        target_uv = self._read_target_match_uv()
+        first_indices, inverse_indices = deduplicate_uv_queries(target_uv)
+        queries = np.zeros((first_indices.shape[0], 3), dtype=np.float64)
+        queries[:, :2] = target_uv[first_indices]
+        surface = self._get_uv_surface()
+        triangle_indices, hit_positions, distances = surface.query_nearest(
+            queries, self._search_max_distance())
+        # 顶点域权重用命中点 + 内钳:采样结果必须落在源面上。
+        rows = surface.resolve(
+            triangle_indices, hit_positions, distances, clamp_inside=True)
+        return CombinedVertexCorrespondence(
+            rows.expand(inverse_indices),
+            target.loop_vertex_indices,
+            target.vertex_count)
+
+    def _build_vertex_nearest(self):
+        """NEAREST = Nearest Vertex:最近源顶点 one-hot。"""
+        kd_tree = self._get_source_vertex_kd()
+        points = self._get_target_match_positions()
+        indices, distances = query_kd_nearest(kd_tree, points)
+        valid = indices >= 0
+        safe_indices = np.where(valid, indices, 0)
+        count = points.shape[0]
+        return GatherCorrespondence(
+            safe_indices[:, None], np.ones((count, 1), dtype=np.float64),
+            distances, valid)
+
+    def _build_vertex_edge(self, mapping):
+        """EDGE_NEAREST = 最近边的较近端点;EDGEINTERP_NEAREST = 最近边上最近点线性插值。"""
+        edge_query = self._get_edge_query()
+        points = self._get_target_match_positions()
+        edge_indices, hit_positions, distances = edge_query.query_nearest(
+            points, self._search_max_distance())
+        valid = edge_indices >= 0
+        safe_edges = np.where(valid, edge_indices, 0)
+        endpoints = edge_query.edge_vertex_indices[safe_edges]
+        source_positions = self._get_source_match_positions()
+        position_a = source_positions[endpoints[:, 0]]
+        segment = source_positions[endpoints[:, 1]] - position_a
+        segment_length_squared = np.einsum('ij,ij->i', segment, segment)
+        parameter = np.einsum('ij,ij->i', hit_positions - position_a, segment)
+        parameter = np.divide(
+            parameter, segment_length_squared,
+            out=np.zeros_like(parameter), where=segment_length_squared > 1e-24)
+        np.clip(parameter, 0.0, 1.0, out=parameter)
+        count = points.shape[0]
+        if mapping == 'EDGE_NEAREST':
+            chosen = np.where(parameter > 0.5, endpoints[:, 1], endpoints[:, 0])
+            return GatherCorrespondence(
+                chosen[:, None], np.ones((count, 1), dtype=np.float64), distances, valid)
+        weights = np.stack((1.0 - parameter, parameter), axis=1)
+        return GatherCorrespondence(endpoints, weights, distances, valid)
+
+    def _build_vertex_nearest_face_vertex(self):
+        """POLY_NEAREST = Nearest Face Vertex:最近面上离查询点最近的角顶点。"""
+        surface = self._get_surface_3d()
+        points = self._get_target_match_positions()
+        triangle_indices, _hit_positions, distances = surface.query_nearest(
+            points, self._search_max_distance())
+        valid = triangle_indices >= 0
+        safe_triangles = np.where(valid, triangle_indices, 0)
+        polygons = self.source_snapshot.triangle_polygon_indices[safe_triangles]
+        best_vertices = self._nearest_polygon_vertex(polygons, points)
+        count = points.shape[0]
+        return GatherCorrespondence(
+            best_vertices[:, None], np.ones((count, 1), dtype=np.float64),
+            distances, valid)
+
+    def _nearest_polygon_vertex(self, polygons, query_points):
+        """逐行求多边形角顶点中离查询点最近者(ragged argmin 全向量化)。"""
+        source = self.source_snapshot
+        counts = source.polygon_loop_totals[polygons]
+        row_indices, within_offsets = ragged_arange(counts)
+        candidate_loops = source.polygon_loop_starts[polygons][row_indices] + within_offsets
+        candidate_vertices = source.loop_vertex_indices[candidate_loops]
+        offsets = self._get_source_match_positions()[candidate_vertices] \
+            - query_points[row_indices]
+        scores = np.einsum('ij,ij->i', offsets, offsets)
+        present_segments, best_rows = segment_best_rows(
+            row_indices, scores, take_maximum=False)
+        best_vertices = np.zeros(polygons.shape[0], dtype=np.int64)
+        best_vertices[present_segments] = candidate_vertices[best_rows]
+        return best_vertices
+
+    def _build_vertex_face_interpolated(self, mapping):
+        surface = self._get_surface_3d()
+        points = self._get_target_match_positions()
+        if mapping == 'POLYINTERP_VNORPROJ':
+            directions = self._match_space_target_normals(
+                self.target_snapshot.vertex_normals)
+            triangle_indices, hit_positions, distances = surface.query_ray(
+                points, directions,
+                self.settings.project_max_distance or None,
+                self.settings.project_bidirectional)
+        else:
+            triangle_indices, hit_positions, distances = surface.query_nearest(
+                points, self._search_max_distance())
+        rows = surface.resolve(
+            triangle_indices, hit_positions, distances, clamp_inside=True)
+        return DirectVertexCorrespondence(rows)
+
+    # ==================== 角点域对应(Blender 角点映射全集) ====================
+
+    def get_corner_correspondence(self):
         if self._corner_correspondence is not None:
             return self._corner_correspondence
-        settings = self.settings
+        mapping = self.settings.corner_mapping
         target = self.target_snapshot
-        domain = settings.matching_domain
-        if domain == 'TOPOLOGY':
-            source_count = self.source_snapshot.loop_count
-            if source_count != target.loop_count:
-                raise ConformError(
-                    f"Topology matching needs equal corner counts "
-                    f"(source {source_count:,}, target {target.loop_count:,})")
-            correspondence = TopologyCornerCorrespondence(target.loop_count)
-        elif domain == 'UV':
-            target_uv = self._read_target_match_uv()
-            first_indices, inverse_indices = deduplicate_uv_queries(target_uv)
-            queries = np.zeros((first_indices.shape[0], 3), dtype=np.float64)
-            queries[:, :2] = target_uv[first_indices]
-            surface = self._get_uv_surface()
-            triangle_indices, _hit_positions, distances = surface.query_nearest(
-                queries, self._search_max_distance())
-            rows = surface.resolve(
-                triangle_indices, queries, distances, clamp_inside=False)
-            correspondence = DirectCornerCorrespondence(rows.expand(inverse_indices))
+        if mapping == 'TOPOLOGY':
+            correspondence = self._build_corner_topology()
+        elif mapping == 'UV':
+            correspondence = self._build_corner_uv()
+        elif mapping in {'NEAREST_NORMAL', 'NEAREST_POLYNOR'}:
+            correspondence = self._build_corner_nearest_normal(mapping)
+        elif mapping == 'NEAREST_POLY':
+            correspondence = self._build_corner_nearest_face_corner()
         else:
-            loop_vertex_indices = target.loop_vertex_indices
-            corner_positions = target.vertex_positions[loop_vertex_indices]
-            bias = settings.corner_sampling_bias
-            nudged = corner_positions + (
-                target.corner_face_centers - corner_positions) * bias
-            if self._is_world_space():
-                nudged = transform_points(nudged, self._target_matrix)
-                corner_positions = transform_points(corner_positions, self._target_matrix)
-            surface = self._get_surface_3d()
-            if settings.surface_method == 'PROJECT':
-                directions = self._target_vertex_query_normals()[loop_vertex_indices]
-                triangle_indices, _hit_positions, distances = surface.query_ray(
-                    nudged, directions,
-                    self.settings.project_max_distance or None,
-                    settings.project_bidirectional)
-            else:
-                triangle_indices, _hit_positions, distances = surface.query_nearest(
-                    nudged, self._search_max_distance())
-            rows = surface.resolve(
-                triangle_indices, corner_positions, distances, clamp_inside=False)
-            correspondence = DirectCornerCorrespondence(rows)
+            # POLYINTERP_NEAREST / POLYINTERP_LNORPROJ:面角插值(最近点 / 角法线投射)。
+            correspondence = self._build_corner_face_interpolated(mapping)
         unmatched = int(np.count_nonzero(~correspondence.valid))
         if unmatched:
             self.warnings.append(
@@ -280,6 +395,123 @@ class ConformSession:
                 f"— they keep their original data")
         self._corner_correspondence = correspondence
         return correspondence
+
+    def _build_corner_topology(self):
+        source_count = self.source_snapshot.loop_count
+        target_count = self.target_snapshot.loop_count
+        if source_count != target_count:
+            raise ConformError(
+                f"Topology mapping needs equal corner counts "
+                f"(source {source_count:,}, target {target_count:,})")
+        return TopologyCornerCorrespondence(target_count)
+
+    def _build_corner_uv(self):
+        target_uv = self._read_target_match_uv()
+        first_indices, inverse_indices = deduplicate_uv_queries(target_uv)
+        queries = np.zeros((first_indices.shape[0], 3), dtype=np.float64)
+        queries[:, :2] = target_uv[first_indices]
+        surface = self._get_uv_surface()
+        triangle_indices, _hit_positions, distances = surface.query_nearest(
+            queries, self._search_max_distance())
+        # 角点域:用真实查询 UV 做无钳权重 → 命中三角形线性延拓,层间恒等传输精确。
+        rows = surface.resolve(
+            triangle_indices, queries, distances, clamp_inside=False)
+        return DirectCornerCorrespondence(rows.expand(inverse_indices))
+
+    def _build_corner_nearest_normal(self, mapping):
+        """NEAREST_NORMAL = 最近源顶点上"拆分法线最匹配"的角点;
+        NEAREST_POLYNOR = 最近源顶点上"所属面法线最匹配"的角点。"""
+        source = self.source_snapshot
+        target = self.target_snapshot
+        if source.loop_count == 0:
+            raise ConformError("Source mesh has no face corners")
+        kd_tree = self._get_source_vertex_kd()
+        vertex_points = self._get_target_match_positions()
+        nearest_source_vertex, vertex_distances = query_kd_nearest(kd_tree, vertex_points)
+        vertex_valid = nearest_source_vertex >= 0
+        loop_vertex = target.loop_vertex_indices
+        corner_source_vertex = np.where(vertex_valid, nearest_source_vertex, 0)[loop_vertex]
+
+        sorted_loops, offsets = source.vertex_loop_csr
+        counts = (offsets[1:] - offsets[:-1])[corner_source_vertex]
+        row_indices, within_offsets = ragged_arange(counts)
+        candidate_loops = sorted_loops[
+            offsets[corner_source_vertex][row_indices] + within_offsets]
+
+        if mapping == 'NEAREST_NORMAL':
+            target_normals = self._match_space_target_normals(target.corner_normals)
+            source_normals = self._match_space_source_normals(source.corner_normals)
+            scores = np.einsum(
+                'ij,ij->i', source_normals[candidate_loops], target_normals[row_indices])
+        else:
+            target_normals = self._match_space_target_normals(
+                target.polygon_normals[target.loop_polygon_indices])
+            source_face_normals = self._match_space_source_normals(source.polygon_normals)
+            scores = np.einsum(
+                'ij,ij->i',
+                source_face_normals[source.loop_polygon_indices[candidate_loops]],
+                target_normals[row_indices])
+
+        present_segments, best_rows = segment_best_rows(
+            row_indices, scores, take_maximum=True)
+        loop_count = target.loop_count
+        best_loops = np.zeros(loop_count, dtype=np.int64)
+        found = np.zeros(loop_count, dtype=bool)
+        best_loops[present_segments] = candidate_loops[best_rows]
+        found[present_segments] = True
+        valid = found & vertex_valid[loop_vertex]
+        distances = vertex_distances[loop_vertex]
+        return GatherCorrespondence(
+            best_loops[:, None], np.ones((loop_count, 1), dtype=np.float64),
+            distances, valid)
+
+    def _build_corner_nearest_face_corner(self):
+        """NEAREST_POLY = Nearest Corner of Nearest Face:最近面上离角点最近的角。"""
+        source = self.source_snapshot
+        target = self.target_snapshot
+        surface = self._get_surface_3d()
+        corner_points = target.vertex_positions[target.loop_vertex_indices]
+        if self._is_world_space():
+            corner_points = transform_points(corner_points, self._target_matrix)
+        triangle_indices, _hit_positions, distances = surface.query_nearest(
+            corner_points, self._search_max_distance())
+        valid = triangle_indices >= 0
+        safe_triangles = np.where(valid, triangle_indices, 0)
+        polygons = source.triangle_polygon_indices[safe_triangles]
+
+        counts = source.polygon_loop_totals[polygons]
+        row_indices, within_offsets = ragged_arange(counts)
+        candidate_loops = source.polygon_loop_starts[polygons][row_indices] + within_offsets
+        candidate_positions = self._get_source_match_positions()[
+            source.loop_vertex_indices[candidate_loops]]
+        offsets = candidate_positions - corner_points[row_indices]
+        scores = np.einsum('ij,ij->i', offsets, offsets)
+        present_segments, best_rows = segment_best_rows(
+            row_indices, scores, take_maximum=False)
+        loop_count = target.loop_count
+        best_loops = np.zeros(loop_count, dtype=np.int64)
+        best_loops[present_segments] = candidate_loops[best_rows]
+        return GatherCorrespondence(
+            best_loops[:, None], np.ones((loop_count, 1), dtype=np.float64),
+            distances, valid)
+
+    def _build_corner_face_interpolated(self, mapping):
+        surface = self._get_surface_3d()
+        nudged, corner_positions = self._corner_query_geometry()
+        if mapping == 'POLYINTERP_LNORPROJ':
+            # Blender 语义:沿角点"拆分法线"投射(LNORPROJ = loop normal projected)。
+            directions = self._match_space_target_normals(
+                self.target_snapshot.corner_normals)
+            triangle_indices, _hit_positions, distances = surface.query_ray(
+                nudged, directions,
+                self.settings.project_max_distance or None,
+                self.settings.project_bidirectional)
+        else:
+            triangle_indices, _hit_positions, distances = surface.query_nearest(
+                nudged, self._search_max_distance())
+        rows = surface.resolve(
+            triangle_indices, corner_positions, distances, clamp_inside=False)
+        return DirectCornerCorrespondence(rows)
 
     # ==================== 影响权重管线 ====================
 
@@ -300,7 +532,8 @@ class ConformSession:
                 base = base * weights
             else:
                 self.warnings.append(
-                    f"Mask vertex group '{mask_name}' not found on target — mask ignored")
+                    f"Mask vertex group '{mask_name}' not found on "
+                    f"'{self.target_object.name}' — mask ignored")
         if settings.use_selection_only:
             base = base * target.vertex_selection.astype(np.float64)
         self._vertex_influence_base = base
@@ -658,16 +891,16 @@ class ConformSession:
         if not transfer_plan:
             raise ConformError("Enable at least one data type to conform")
 
-        if settings.matching_domain == 'SURFACE':
-            # 3D 匹配依赖目标顶点坐标:在 Shape 写回之前预建对应,冻结几何快照。
-            needs_vertex = (settings.use_shape or settings.use_shape_keys
-                            or settings.use_vertex_groups or settings.use_color_attributes)
-            needs_corner = (settings.use_uv_layers or settings.use_color_attributes
-                            or settings.use_corner_normals)
-            if needs_vertex:
-                self.get_vertex_correspondence()
-            if needs_corner and self.target_snapshot.loop_count > 0:
-                self.get_corner_correspondence()
+        # 依赖目标几何的映射:在 Shape 写回之前预建对应,冻结几何快照。
+        needs_vertex = (settings.use_shape or settings.use_shape_keys
+                        or settings.use_vertex_groups or settings.use_color_attributes)
+        needs_corner = (settings.use_uv_layers or settings.use_color_attributes
+                        or settings.use_corner_normals)
+        if needs_vertex and settings.vertex_mapping not in _POSITION_INDEPENDENT_MAPPINGS:
+            self.get_vertex_correspondence()
+        if (needs_corner and settings.corner_mapping not in _POSITION_INDEPENDENT_MAPPINGS
+                and self.target_snapshot.loop_count > 0):
+            self.get_corner_correspondence()
 
         for transfer in transfer_plan:
             summary = transfer()

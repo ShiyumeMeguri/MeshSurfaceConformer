@@ -1,5 +1,6 @@
-# 插件设置:挂在 Object 上的 PropertyGroup(逐对象持久化,迭代工作流友好)。
-# UI 文案遵循 Blender 官方英文风格,描述写清语义与单位。
+# 插件设置:挂在 Scene 上的 PropertyGroup(工具型全局配置,配合"活动物体→选中物体"约定)。
+# 映射枚举与 Blender DataTransfer 修改器逐字对齐(标识符与命名一致),
+# 额外追加本插件独有的 UV Interpolated 匹配。
 
 import bpy
 from bpy.props import (
@@ -12,23 +13,56 @@ from bpy.props import (
 from bpy.types import PropertyGroup
 
 
-def poll_source_mesh(self, candidate):
-    """源对象:任意网格,但不能是自己。"""
-    return candidate.type == 'MESH' and candidate != bpy.context.active_object
-
-
 def poll_armature(self, candidate):
     return candidate.type == 'ARMATURE'
 
 
+# Blender rna_enum_dt_method_vertex_items 全集 + UV。
+_VERTEX_MAPPING_ITEMS = [
+    ('TOPOLOGY', "Topology",
+     "Copy from identical topology meshes", 0),
+    ('NEAREST', "Nearest Vertex",
+     "Copy from closest vertex", 1),
+    ('EDGE_NEAREST', "Nearest Edge Vertex",
+     "Copy from closest vertex of closest edge", 2),
+    ('EDGEINTERP_NEAREST', "Nearest Edge Interpolated",
+     "Copy from interpolated values of vertices from closest point on closest edge", 3),
+    ('POLY_NEAREST', "Nearest Face Vertex",
+     "Copy from closest vertex of closest face", 4),
+    ('POLYINTERP_NEAREST', "Nearest Face Interpolated",
+     "Copy from interpolated values of vertices from closest point on closest face", 5),
+    ('POLYINTERP_VNORPROJ', "Projected Face Interpolated",
+     "Copy from interpolated values of vertices from point on closest face hit "
+     "by normal-projection", 6),
+    ('UV', "UV Interpolated",
+     "Match through UV space: sample where each element's UV lands in the source "
+     "UV layout (unique to this add-on)", 7),
+]
+
+# Blender rna_enum_dt_method_loop_items 全集 + UV。
+_CORNER_MAPPING_ITEMS = [
+    ('TOPOLOGY', "Topology",
+     "Copy from identical topology meshes", 0),
+    ('NEAREST_NORMAL', "Nearest Corner and Best Matching Normal",
+     "Copy from nearest corner which has the best matching normal", 1),
+    ('NEAREST_POLYNOR', "Nearest Corner and Best Matching Face Normal",
+     "Copy from nearest corner which has the face with the best matching normal "
+     "to destination corner's face one", 2),
+    ('NEAREST_POLY', "Nearest Corner of Nearest Face",
+     "Copy from nearest corner of nearest face", 3),
+    ('POLYINTERP_NEAREST', "Nearest Face Interpolated",
+     "Copy from interpolated corners of the nearest source face", 4),
+    ('POLYINTERP_LNORPROJ', "Projected Face Interpolated",
+     "Copy from interpolated corners of the source face hit by corner normal "
+     "projection", 5),
+    ('UV', "UV Interpolated",
+     "Match through UV space: sample where each corner's UV lands in the source "
+     "UV layout (unique to this add-on)", 6),
+]
+
+
 class MeshSurfaceConformerSettings(PropertyGroup):
     # ---------- 源 ----------
-    source_object: PointerProperty(
-        name="Source",
-        description="Mesh object to sample data from",
-        type=bpy.types.Object,
-        poll=poll_source_mesh,
-    )
     use_evaluated_source: BoolProperty(
         name="Use Modified Source",
         description="Sample the source with modifiers and shape keys applied "
@@ -37,23 +71,10 @@ class MeshSurfaceConformerSettings(PropertyGroup):
     )
 
     # ---------- 匹配 ----------
-    matching_domain: EnumProperty(
-        name="Match By",
-        description="How target elements find their counterpart on the source",
-        items=[
-            ('SURFACE', "Surface", "Interpolated closest point on the source surface. "
-             "Works across completely different topologies", 'SNAP_FACE_CENTER', 0),
-            ('UV', "UV", "Match through UV space: elements sample where their UV "
-             "lands in the source UV layout", 'UV', 1),
-            ('TOPOLOGY', "Topology", "Copy by element index. Requires identical "
-             "vertex/corner counts", 'MESH_DATA', 2),
-        ],
-        default='SURFACE',
-    )
     transform_space: EnumProperty(
         name="Space",
-        description="Coordinate space for surface matching and for mapping "
-                    "positional data between the two objects",
+        description="Coordinate space for matching and for mapping positional "
+                    "data between the two objects",
         items=[
             ('WORLD', "World", "Match and map positions in world space", 'WORLD', 0),
             ('LOCAL', "Local", "Match and map positions in each object's local space",
@@ -61,23 +82,24 @@ class MeshSurfaceConformerSettings(PropertyGroup):
         ],
         default='WORLD',
     )
-    surface_method: EnumProperty(
-        name="Method",
-        description="How target elements are cast onto the source surface",
-        items=[
-            ('NEAREST', "Nearest Surface Point",
-             "Closest point on the source surface, interpolated inside the hit face",
-             'SNAP_ON', 0),
-            ('PROJECT', "Normal Projection",
-             "Ray cast along the target normals, interpolated inside the hit face",
-             'PROP_PROJECTED', 1),
-        ],
-        default='NEAREST',
+    vertex_mapping: EnumProperty(
+        name="Vertex Mapping",
+        description="How vertex data (shape, shape keys, vertex groups, point colors) "
+                    "finds its counterpart on the source",
+        items=_VERTEX_MAPPING_ITEMS,
+        default='POLYINTERP_NEAREST',
+    )
+    corner_mapping: EnumProperty(
+        name="Corner Mapping",
+        description="How face corner data (UVs, corner colors, custom normals) "
+                    "finds its counterpart on the source",
+        items=_CORNER_MAPPING_ITEMS,
+        default='POLYINTERP_NEAREST',
     )
     project_bidirectional: BoolProperty(
         name="Bidirectional",
-        description="Cast rays both along and against the normal and keep the "
-                    "nearest hit",
+        description="Cast projection rays both along and against the normal and "
+                    "keep the nearest hit",
         default=True,
     )
     project_max_distance: FloatProperty(
@@ -89,9 +111,9 @@ class MeshSurfaceConformerSettings(PropertyGroup):
     )
     corner_sampling_bias: FloatProperty(
         name="Corner Bias",
-        description="For face-corner data (UVs, colors, normals): pull the sample "
-                    "point slightly towards the face center so corners on either "
-                    "side of a seam land on the correct source face",
+        description="For interpolated corner mappings: pull the sample point "
+                    "slightly towards the face center so corners on either side "
+                    "of a seam land on the correct source face",
         default=0.05,
         min=0.001,
         max=0.5,
@@ -104,8 +126,8 @@ class MeshSurfaceConformerSettings(PropertyGroup):
     )
     uv_match_layer_target: StringProperty(
         name="Target Layer",
-        description="Target UV layer used as the matching space "
-                    "(empty = active layer)",
+        description="Target UV layer used as the matching space; resolved per "
+                    "target object (empty = its active layer)",
     )
     use_max_distance: BoolProperty(
         name="Max Distance",
@@ -140,7 +162,8 @@ class MeshSurfaceConformerSettings(PropertyGroup):
     )
     vertex_group_mask: StringProperty(
         name="Vertex Group",
-        description="Limit the effect to this vertex group on the target",
+        description="Limit the effect to this vertex group on each target "
+                    "(resolved by name per target object)",
     )
     invert_vertex_group_mask: BoolProperty(
         name="Invert",
@@ -168,7 +191,7 @@ class MeshSurfaceConformerSettings(PropertyGroup):
     snap_shape_to_vertices: BoolProperty(
         name="Snap to Vertices",
         description="After matching, snap each result to the nearest source vertex "
-                    "(legacy behavior — off keeps the smooth interpolated surface)",
+                    "(off keeps the smooth interpolated surface)",
         default=False,
     )
 

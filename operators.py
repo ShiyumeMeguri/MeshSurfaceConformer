@@ -1,4 +1,5 @@
-# 算子层:读取对象上的设置,驱动 ConformSession,汇报结果。
+# 算子层:遵循 Blender 官方 Link/Transfer Data 约定 —— 活动物体是源,
+# 其余选中网格是目标,无需手动指定源;设置读自 Scene 级 PropertyGroup。
 # 引擎全程纯数据操作(无 bpy.ops),唯一的模式切换用于把编辑模式选择/几何冲刷回网格。
 
 import time
@@ -16,96 +17,120 @@ def _any_data_type_enabled(settings):
             or settings.use_corner_normals)
 
 
+def gather_source_and_targets(context):
+    """活动物体 = 源,其余选中网格 = 目标(与 object.data_transfer 同一约定)。"""
+    source = context.active_object
+    if source is None or source.type != 'MESH':
+        return None, []
+    targets = [candidate for candidate in context.selected_objects
+               if candidate.type == 'MESH' and candidate != source]
+    return source, targets
+
+
 class OBJECT_OT_mesh_surface_conform(Operator):
-    """Conform the enabled data types of the active mesh onto the source surface"""
+    """Conform the enabled data types from the active mesh onto the other selected meshes"""
     bl_idname = "object.mesh_surface_conform"
     bl_label = "Conform Surface Data"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        active = context.active_object
-        if active is None or active.type != 'MESH':
-            cls.poll_message_set("Active object must be a mesh")
+        source, targets = gather_source_and_targets(context)
+        if source is None:
+            cls.poll_message_set("Active object must be a mesh (the source)")
             return False
-        settings = active.mesh_surface_conformer
-        source = settings.source_object
-        if source is None or source.type != 'MESH' or source == active:
-            cls.poll_message_set("Pick a different mesh as the source")
+        if not targets:
+            cls.poll_message_set("Select the target meshes, then the source last")
             return False
-        if not _any_data_type_enabled(settings):
+        if not _any_data_type_enabled(context.scene.mesh_surface_conformer):
             cls.poll_message_set("Enable at least one data type")
             return False
         return True
 
     def execute(self, context):
-        target_object = context.active_object
-        settings = target_object.mesh_surface_conformer
+        source, targets = gather_source_and_targets(context)
+        settings = context.scene.mesh_surface_conformer
         started_at = time.perf_counter()
 
-        original_mode = target_object.mode
+        original_mode = source.mode
         if original_mode != 'OBJECT':
-            # 冲刷编辑网格与选择状态;数据级写回也必须在物体模式下进行。
+            # 冲刷编辑网格与选择状态(多物体编辑一并退出);数据级写回必须在物体模式。
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        session = None
+        conformed_targets = []
+        last_summaries = []
         try:
-            session = ConformSession(context, settings, target_object)
-            summaries, warnings = session.run()
-        except ConformError as error:
-            if session is not None:
-                for warning in session.warnings:
-                    self.report({'WARNING'}, warning)
-            self.report({'ERROR'}, str(error))
-            return {'CANCELLED'}
+            for target in targets:
+                session = ConformSession(context, settings, source, target)
+                try:
+                    summaries, warnings = session.run()
+                except ConformError as error:
+                    for warning in session.warnings:
+                        self.report({'WARNING'}, f"{target.name}: {warning}")
+                    self.report({'ERROR'}, f"{target.name}: {error}")
+                    continue
+                finally:
+                    session.free()
+                for warning in warnings:
+                    self.report({'WARNING'}, f"{target.name}: {warning}")
+                conformed_targets.append(target.name)
+                last_summaries = summaries
         finally:
-            if session is not None:
-                session.free()
             if original_mode != 'OBJECT':
                 bpy.ops.object.mode_set(mode=original_mode)
 
-        for warning in warnings:
-            self.report({'WARNING'}, warning)
+        if not conformed_targets:
+            return {'CANCELLED'}
         elapsed = time.perf_counter() - started_at
-        self.report(
-            {'INFO'},
-            f"Conformed {', '.join(summaries)} from '{settings.source_object.name}' "
-            f"in {elapsed:.2f}s")
+        if len(conformed_targets) == 1:
+            self.report(
+                {'INFO'},
+                f"Conformed {', '.join(last_summaries)} from '{source.name}' to "
+                f"'{conformed_targets[0]}' in {elapsed:.2f}s")
+        else:
+            self.report(
+                {'INFO'},
+                f"Conformed {len(conformed_targets)} objects from '{source.name}' "
+                f"in {elapsed:.2f}s")
         return {'FINISHED'}
 
 
 class OBJECT_OT_mesh_surface_conform_drivers(Operator):
-    """Copy the shape key drivers from the source to the matching shape keys on the active mesh"""
+    """Copy the shape key drivers from the active mesh to the matching shape keys on the other selected meshes"""
     bl_idname = "object.mesh_surface_conform_drivers"
     bl_label = "Transfer Shape Key Drivers"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        active = context.active_object
-        if active is None or active.type != 'MESH':
-            cls.poll_message_set("Active object must be a mesh")
+        source, targets = gather_source_and_targets(context)
+        if source is None:
+            cls.poll_message_set("Active object must be a mesh (the source)")
             return False
-        settings = active.mesh_surface_conformer
-        source = settings.source_object
-        if source is None or source.type != 'MESH' or source == active:
-            cls.poll_message_set("Pick a different mesh as the source")
+        if not targets:
+            cls.poll_message_set("Select the target meshes, then the source last")
             return False
-        if active.data.shape_keys is None:
-            cls.poll_message_set("Target has no shape keys — transfer shape keys first")
+        if source.data.shape_keys is None:
+            cls.poll_message_set("Source has no shape keys")
             return False
         return True
 
     def execute(self, context):
-        target_object = context.active_object
-        settings = target_object.mesh_surface_conformer
-        transferred_count = transfer_shape_key_drivers(
-            settings.source_object, target_object,
-            settings.armature_source, settings.armature_target)
-        if transferred_count == 0:
-            self.report({'WARNING'}, "No matching shape key drivers found on the source")
+        source, targets = gather_source_and_targets(context)
+        settings = context.scene.mesh_surface_conformer
+        transferred_total = 0
+        for target in targets:
+            if target.data.shape_keys is None:
+                self.report(
+                    {'WARNING'},
+                    f"{target.name}: no shape keys — transfer shape keys first")
+                continue
+            transferred_total += transfer_shape_key_drivers(
+                source, target, settings.armature_source, settings.armature_target)
+        if transferred_total == 0:
+            self.report({'WARNING'}, "No matching shape key drivers found")
             return {'CANCELLED'}
-        self.report({'INFO'}, f"Transferred {transferred_count} shape key driver(s)")
+        self.report({'INFO'}, f"Transferred {transferred_total} shape key driver(s)")
         return {'FINISHED'}
 
 

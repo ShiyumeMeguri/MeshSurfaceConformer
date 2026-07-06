@@ -247,8 +247,11 @@ class MeshBufferSnapshot:
         mesh.loop_triangles.foreach_get("vertices", vertex_buffer)
         loop_buffer = np.empty(triangle_count * 3, dtype=np.int32)
         mesh.loop_triangles.foreach_get("loops", loop_buffer)
+        polygon_buffer = np.empty(triangle_count, dtype=np.int32)
+        mesh.loop_triangles.foreach_get("polygon_index", polygon_buffer)
         return (vertex_buffer.astype(np.int64).reshape(triangle_count, 3),
-                loop_buffer.astype(np.int64).reshape(triangle_count, 3))
+                loop_buffer.astype(np.int64).reshape(triangle_count, 3),
+                polygon_buffer.astype(np.int64))
 
     @property
     def triangle_vertex_indices(self):
@@ -259,19 +262,60 @@ class MeshBufferSnapshot:
         return self._cached("loop_triangles", self._build_loop_triangles)[1]
 
     @property
+    def triangle_polygon_indices(self):
+        """每个 loop 三角形所属的多边形索引,(T,)。"""
+        return self._cached("loop_triangles", self._build_loop_triangles)[2]
+
+    @property
+    def edge_vertex_indices(self):
+        """(E, 2) 边端点索引。"""
+        return self._cached(
+            "edge_vertex_indices", lambda: _read_ints(self.mesh.edges, "vertices", 2))
+
+    @property
+    def polygon_normals(self):
+        return self._cached(
+            "polygon_normals", lambda: _read_floats(self.mesh.polygon_normals, "vector", 3))
+
+    @property
+    def polygon_loop_starts(self):
+        return self._cached(
+            "polygon_loop_starts", lambda: _read_ints(self.mesh.polygons, "loop_start", 1))
+
+    @property
+    def polygon_loop_totals(self):
+        return self._cached(
+            "polygon_loop_totals", lambda: _read_ints(self.mesh.polygons, "loop_total", 1))
+
+    @property
+    def loop_polygon_indices(self):
+        """每个 loop 所属的多边形索引,(L,)。"""
+        def build():
+            loop_starts = self.polygon_loop_starts
+            loop_totals = self.polygon_loop_totals
+            # 各面 loop 区间按 loop_start 升序恰好铺满 [0, L),按序 repeat 即得 loop→face。
+            order = np.argsort(loop_starts, kind='stable')
+            return np.repeat(order, loop_totals[order])
+        return self._cached("loop_polygon_indices", build)
+
+    @property
     def corner_face_centers(self):
         """每个 loop 所属面的中心坐标,(L, 3)。用于角点导向偏置采样。"""
         def build():
-            mesh = self.mesh
-            face_count = len(mesh.polygons)
-            centers = _read_floats(mesh.polygons, "center", 3)
-            loop_starts = _read_ints(mesh.polygons, "loop_start", 1)
-            loop_totals = _read_ints(mesh.polygons, "loop_total", 1)
-            # 各面 loop 区间按 loop_start 升序恰好铺满 [0, L),按序 repeat 即得 loop→face。
-            order = np.argsort(loop_starts, kind='stable')
-            loop_face_indices = np.repeat(order, loop_totals[order])
-            return centers[loop_face_indices]
+            centers = _read_floats(self.mesh.polygons, "center", 3)
+            return centers[self.loop_polygon_indices]
         return self._cached("corner_face_centers", build)
+
+    @property
+    def vertex_loop_csr(self):
+        """顶点 → 其全部 loop 的 CSR 反查表:(按顶点分组排序的 loop 索引, 段偏移 (V+1,))。"""
+        def build():
+            loop_vertex = self.loop_vertex_indices
+            order = np.argsort(loop_vertex, kind='stable')
+            counts = np.bincount(loop_vertex, minlength=self.vertex_count)
+            offsets = np.concatenate(([0], np.cumsum(counts)))
+            return order, offsets
+        return self._cached("vertex_loop_csr", build)
 
     @property
     def corner_normals(self):
