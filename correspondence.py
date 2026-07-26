@@ -9,10 +9,17 @@
 #   3. UV 空间的顶点域采样必须经 CombinedVertexCorrespondence 收敛:
 #      同一网格顶点的多个 UV loop 按逆距离权重合并成唯一结果,
 #      修复旧版"最后写入者赢"导致的合并顶点/接缝顶点错乱。
+#   4. 每种对应关系都实现统一签名 sample(data, domain):源数据是顶点域还是角点域
+#      由调用方声明,与对应关系自身的域无关 —— 这是"任意通道 → 任意通道"互转的地基
+#      (跨域时经 SourceDomainBridge 折算,角点→顶点取均值,顶点→角点直接展开)。
 
 import numpy as np
 from mathutils.bvhtree import BVHTree
 from mathutils.kdtree import KDTree
+
+# 域标识符,与 Blender attribute domain 一致。
+POINT = 'POINT'
+CORNER = 'CORNER'
 
 # find_nearest / ray_cast 的"无限"搜索半径(mathutils 默认上限量级)。
 _UNLIMITED_DISTANCE = 1.0e18
@@ -100,26 +107,70 @@ def segment_best_rows(segment_indices, scores, take_maximum):
     return sorted_segments[first_mask], order[first_mask]
 
 
+# ==================== 源域折算 ====================
+
+class SourceDomainBridge:
+    """源网格的 角点域 ⇄ 顶点域 折算器。
+
+    让任何一种对应关系都能采样任何一个域的源数据:
+    角点 → 顶点取同顶点各角点均值(接缝/硬边的多值在此收敛),
+    顶点 → 角点按 loop→vertex 表直接展开(无损)。
+    """
+
+    __slots__ = ("loop_vertex_indices", "vertex_count", "_loop_counts")
+
+    def __init__(self, loop_vertex_indices, vertex_count):
+        self.loop_vertex_indices = np.asarray(loop_vertex_indices, dtype=np.int64)
+        self.vertex_count = int(vertex_count)
+        counts = np.bincount(
+            self.loop_vertex_indices, minlength=self.vertex_count).astype(np.float64)
+        # 孤立顶点(无角点)计数置 1 防除零,其行恒为 0。
+        self._loop_counts = np.where(counts > 0.0, counts, 1.0)
+
+    def corner_to_vertex(self, corner_data):
+        data = np.asarray(corner_data, dtype=np.float64)
+        channel_count = data.shape[1]
+        result = np.empty((self.vertex_count, channel_count), dtype=np.float64)
+        for channel in range(channel_count):
+            result[:, channel] = np.bincount(
+                self.loop_vertex_indices, weights=data[:, channel],
+                minlength=self.vertex_count)
+        return result / self._loop_counts[:, None]
+
+    def vertex_to_corner(self, vertex_data):
+        return np.asarray(vertex_data, dtype=np.float64)[self.loop_vertex_indices]
+
+    def to_domain(self, data, from_domain, to_domain):
+        if from_domain == to_domain:
+            return np.asarray(data, dtype=np.float64)
+        if to_domain == POINT:
+            return self.corner_to_vertex(data)
+        return self.vertex_to_corner(data)
+
+
 # ==================== 对应关系表达 ====================
 
 class GatherCorrespondence:
     """通用聚合对应:每行 K 个源元素索引 + 权重。
 
-    索引指向调用方传入数据数组的行,顶点域/角点域通用:
+    索引指向 index_domain 域的源元素:
     K=1 = 单元素吸附(Nearest Vertex / Nearest Corner 系映射),
     K=2 = 边端点插值,K=3 及以上 = 面插值。
+    采样另一个域的源数据时先经 bridge 折算,再走同一套 gather。
     """
 
-    __slots__ = ("valid", "distances", "_indices", "_weights")
+    __slots__ = ("valid", "distances", "index_domain", "_indices", "_weights", "_bridge")
 
-    def __init__(self, indices, weights, distances, valid):
+    def __init__(self, indices, weights, distances, valid, index_domain, bridge):
         self._indices = indices      # (N, K) int64
         self._weights = weights      # (N, K) float64
         self.distances = distances   # (N,) float64
         self.valid = valid           # (N,) bool
+        self.index_domain = index_domain
+        self._bridge = bridge
 
-    def sample(self, data):
-        data = np.asarray(data, dtype=np.float64)
+    def sample(self, data, domain=POINT):
+        data = self._bridge.to_domain(data, domain, self.index_domain)
         return np.einsum('nkc,nk->nc', data[self._indices], self._weights)
 
 
@@ -157,6 +208,18 @@ class CorrespondenceRows:
         data = np.asarray(corner_data, dtype=np.float64)
         gather = self._owner.triangle_corner_indices[self._triangle_indices]
         return np.einsum('nkc,nk->nc', data[gather], self._weights)
+
+    def as_nearest(self):
+        """把重心权重塌成命中三角形里最近那个角的 one-hot。
+
+        基准通道的"最近元素"语义:不插值,直接取值最接近的那个源元素,
+        数值一个不改地搬过来(离散数据/整数 ID 类通道要的就是这个)。
+        """
+        rows = np.arange(self._weights.shape[0], dtype=np.int64)
+        weights = np.zeros_like(self._weights)
+        weights[rows, np.argmax(self._weights, axis=1)] = 1.0
+        return CorrespondenceRows(
+            self.valid, self._triangle_indices, weights, self.distances, self._owner)
 
 
 class SurfaceCorrespondence:
@@ -290,7 +353,10 @@ def query_kd_nearest(kd_tree, query_points):
 
 
 class DirectVertexCorrespondence:
-    """3D 空间逐顶点直查的顶点域对应:一顶点一命中,天然一致。"""
+    """3D 空间逐顶点直查的顶点域对应:一顶点一命中,天然一致。
+
+    命中的是源三角形 + 重心权重,所以顶点域与角点域源数据都能在命中点精确插值。
+    """
 
     __slots__ = ("valid", "distances", "_rows")
 
@@ -299,8 +365,10 @@ class DirectVertexCorrespondence:
         self.valid = rows.valid
         self.distances = rows.distances
 
-    def sample(self, vertex_data):
-        return self._rows.sample_vertex_data(vertex_data)
+    def sample(self, data, domain=POINT):
+        if domain == CORNER:
+            return self._rows.sample_corner_data(data)
+        return self._rows.sample_vertex_data(data)
 
 
 class CombinedVertexCorrespondence:
@@ -335,8 +403,11 @@ class CombinedVertexCorrespondence:
             minlength=vertex_count)
         self.distances[~self.valid] = np.inf
 
-    def sample(self, vertex_data):
-        loop_samples = self._loop_rows.sample_vertex_data(vertex_data)
+    def sample(self, data, domain=POINT):
+        if domain == CORNER:
+            loop_samples = self._loop_rows.sample_corner_data(data)
+        else:
+            loop_samples = self._loop_rows.sample_vertex_data(data)
         weighted = loop_samples * self._loop_weights[:, None]
         channel_count = weighted.shape[1]
         result = np.zeros((self._vertex_count, channel_count), dtype=np.float64)
@@ -351,14 +422,15 @@ class CombinedVertexCorrespondence:
 class TopologyVertexCorrespondence:
     """拓扑(顶点序号)直通对应:顶点数一致时的逐序号拷贝。"""
 
-    __slots__ = ("valid", "distances")
+    __slots__ = ("valid", "distances", "_bridge")
 
-    def __init__(self, vertex_count):
+    def __init__(self, vertex_count, bridge):
         self.valid = np.ones(vertex_count, dtype=bool)
         self.distances = np.zeros(vertex_count, dtype=np.float64)
+        self._bridge = bridge
 
-    def sample(self, vertex_data):
-        return np.asarray(vertex_data, dtype=np.float64).copy()
+    def sample(self, data, domain=POINT):
+        return self._bridge.to_domain(data, domain, POINT).copy()
 
 
 class DirectCornerCorrespondence:
@@ -371,32 +443,43 @@ class DirectCornerCorrespondence:
         self.valid = rows.valid
         self.distances = rows.distances
 
-    def sample(self, corner_data):
-        return self._rows.sample_corner_data(corner_data)
+    def sample(self, data, domain=CORNER):
+        if domain == POINT:
+            return self._rows.sample_vertex_data(data)
+        return self._rows.sample_corner_data(data)
 
 
 class TopologyCornerCorrespondence:
     """拓扑直通的角点域对应:loop 数一致时的逐序号拷贝。"""
 
-    __slots__ = ("valid", "distances")
+    __slots__ = ("valid", "distances", "_bridge")
 
-    def __init__(self, loop_count):
+    def __init__(self, loop_count, bridge):
         self.valid = np.ones(loop_count, dtype=bool)
         self.distances = np.zeros(loop_count, dtype=np.float64)
+        self._bridge = bridge
 
-    def sample(self, corner_data):
-        return np.asarray(corner_data, dtype=np.float64).copy()
+    def sample(self, data, domain=CORNER):
+        return self._bridge.to_domain(data, domain, CORNER).copy()
 
 
-def deduplicate_uv_queries(uv_coordinates):
-    """按 2^24 量化把重复 UV 查询点去重(内部顶点的多个 loop 通常共享同一 UV,
-    去重后查询量典型减少 4~6 倍)。返回 (唯一行索引, 逆映射)。"""
-    quantized = np.round(np.asarray(uv_coordinates, dtype=np.float64) * 16777216.0).astype(np.int64)
-    # 双通道压成单个 int64 键:|qv| < 2^31 时无碰撞。
-    composite_keys = quantized[:, 0] * 4294967296 + quantized[:, 1]
-    _unique_keys, first_indices, inverse_indices = np.unique(
-        composite_keys, return_index=True, return_inverse=True)
-    return first_indices, inverse_indices
+def deduplicate_queries(query_points):
+    """把重复的查询点去重(内部顶点的多个 loop 通常共享同一 UV / 同一属性值,
+    去重后查询量典型减少 4~6 倍)。返回 (唯一行索引, 逆映射)。
+
+    量化步长按数据幅度自适应:UV(~1)与世界坐标(~1e3)都拿到 ~1e-7 的相对精度,
+    所以任意基准通道都能安全共用这一条去重路径。
+    """
+    values = np.asarray(query_points, dtype=np.float64)
+    if values.size == 0:
+        empty = np.empty(0, dtype=np.int64)
+        return empty, empty
+    magnitude = float(np.max(np.abs(values)))
+    step = 16777216.0 / max(magnitude, 1.0)
+    quantized = np.round(values * step).astype(np.int64)
+    _unique_rows, first_indices, inverse_indices = np.unique(
+        quantized, axis=0, return_index=True, return_inverse=True)
+    return first_indices, inverse_indices.reshape(-1)
 
 
 def snap_positions_to_nearest(positions, reference_positions, valid_mask):

@@ -103,9 +103,124 @@ def write_color_attribute(attribute, colors):
     attribute.data.foreach_set("color", colors.astype(np.float32).ravel())
 
 
+# ---------- 通用属性(mesh.attributes 全域) ----------
+
+# data_type → (RNA 值属性名, 分量数, 数值种类)。未列出的类型(STRING/FLOAT4X4)不支持。
+_ATTRIBUTE_LAYOUT = {
+    'FLOAT': ("value", 1, 'FLOAT'),
+    'FLOAT_VECTOR': ("vector", 3, 'FLOAT'),
+    'FLOAT2': ("vector", 2, 'FLOAT'),
+    'FLOAT_COLOR': ("color", 4, 'FLOAT'),
+    'BYTE_COLOR': ("color", 4, 'FLOAT'),
+    'QUATERNION': ("value", 4, 'FLOAT'),
+    'INT': ("value", 1, 'INT'),
+    'INT8': ("value", 1, 'INT'),
+    'INT32_2D': ("value", 2, 'INT'),
+    'BOOLEAN': ("value", 1, 'BOOL'),
+}
+
+# 可作为转换写入目标的属性类型(供 UI 枚举)。
+ATTRIBUTE_TYPE_ITEMS = [
+    ('FLOAT', "Float", "Single float value", 0),
+    ('FLOAT_VECTOR', "Vector", "3D float vector", 1),
+    ('FLOAT2', "2D Vector", "2D float vector", 2),
+    ('FLOAT_COLOR', "Color", "RGBA float color", 3),
+    ('BYTE_COLOR', "Byte Color", "RGBA 8-bit color", 4),
+    ('INT', "Integer", "Single integer value", 5),
+    ('BOOLEAN', "Boolean", "True/false value", 6),
+]
+
+
+def attribute_component_count(data_type):
+    layout = _ATTRIBUTE_LAYOUT.get(data_type)
+    return layout[1] if layout is not None else 0
+
+
+def read_generic_attribute(mesh, attribute_name):
+    """读取任意网格属性。返回 (domain, data_type, (N, C) float64);不支持/不存在返回 None。"""
+    attribute = mesh.attributes.get(attribute_name)
+    if attribute is None:
+        return None
+    layout = _ATTRIBUTE_LAYOUT.get(attribute.data_type)
+    if layout is None:
+        return None
+    value_attribute, item_size, kind = layout
+    count = len(attribute.data)
+    if kind == 'FLOAT':
+        buffer = np.empty(count * item_size, dtype=np.float32)
+    elif kind == 'INT':
+        buffer = np.empty(count * item_size, dtype=np.int32)
+    else:
+        buffer = np.empty(count * item_size, dtype=bool)
+    try:
+        attribute.data.foreach_get(value_attribute, buffer)
+    except (RuntimeError, TypeError, AttributeError):
+        return None
+    values = buffer.astype(np.float64).reshape(count, item_size)
+    return attribute.domain, attribute.data_type, values
+
+
+def ensure_generic_attribute(mesh, attribute_name, data_type, domain):
+    """确保属性存在且域/类型一致;不一致时重建。返回 (attribute, recreated);无法建立返回 (None, False)。"""
+    attribute = mesh.attributes.get(attribute_name)
+    recreated = False
+    if attribute is not None and (attribute.domain != domain
+                                  or attribute.data_type != data_type):
+        try:
+            mesh.attributes.remove(attribute)
+        except RuntimeError:
+            return None, False  # 内建属性(position 等)不可重建
+        attribute = None
+        recreated = True
+    if attribute is None:
+        try:
+            attribute = mesh.attributes.new(
+                name=attribute_name, type=data_type, domain=domain)
+        except (RuntimeError, TypeError):
+            return None, recreated
+    return attribute, recreated
+
+
+def write_generic_attribute(attribute, values):
+    """写回任意网格属性,按其数值种类做精确 dtype 转换。"""
+    layout = _ATTRIBUTE_LAYOUT.get(attribute.data_type)
+    if layout is None:
+        return False
+    value_attribute, _item_size, kind = layout
+    if kind == 'FLOAT':
+        buffer = values.astype(np.float32).ravel()
+    elif kind == 'INT':
+        buffer = np.rint(values).astype(np.int32).ravel()
+    else:
+        buffer = (values > 0.5).ravel()
+    try:
+        attribute.data.foreach_set(value_attribute, buffer)
+    except (RuntimeError, TypeError):
+        return False
+    return True
+
+
 def write_vertex_positions(mesh, positions):
     mesh.vertices.foreach_set("co", positions.astype(np.float32).ravel())
     mesh.update()
+
+
+def apply_vertex_positions(target_object, positions):
+    """把顶点移动到新坐标,并保住形态键。
+
+    目标带形态键时:Basis 与全部键整体平移同样的位移,各键的相对形变原样保留
+    (只写网格顶点在有键时视口不生效,是旧版的隐性缺陷)。
+    """
+    mesh = target_object.data
+    if mesh.shape_keys is not None:
+        key_blocks = mesh.shape_keys.key_blocks
+        vertex_count = len(mesh.vertices)
+        basis_positions = read_shape_key_positions(key_blocks[0], vertex_count)
+        shift = positions - basis_positions
+        for key_block in key_blocks:
+            key_positions = read_shape_key_positions(key_block, vertex_count)
+            write_shape_key_positions(key_block, key_positions + shift)
+    write_vertex_positions(mesh, positions)
 
 
 def ensure_shape_key(target_object, shape_key_name):
@@ -352,6 +467,60 @@ class MeshBufferSnapshot:
         return self._cached(
             ("color_attribute", attribute_name),
             lambda: read_color_attribute(self.mesh, attribute_name))
+
+    # ---------- 通用属性 ----------
+
+    @property
+    def attribute_names(self):
+        """可读的用户属性名(过滤掉 '.' 开头的内部属性)。"""
+        return [attribute.name for attribute in self.mesh.attributes
+                if not attribute.name.startswith(".")]
+
+    @property
+    def active_attribute_name(self):
+        active = self.mesh.attributes.active
+        return active.name if active is not None else None
+
+    def read_generic_attribute(self, attribute_name):
+        return self._cached(
+            ("attribute", attribute_name),
+            lambda: read_generic_attribute(self.mesh, attribute_name))
+
+    # ---------- 形态键 ----------
+
+    @property
+    def shape_key_names(self):
+        """形态键始终读自原始对象数据(求值网格不携带形态键数据块)。"""
+        shape_keys = self.object.data.shape_keys
+        if shape_keys is None:
+            return []
+        return [key_block.name for key_block in shape_keys.key_blocks]
+
+    @property
+    def active_shape_key_name(self):
+        shape_keys = self.object.data.shape_keys
+        if shape_keys is None:
+            return None
+        index = self.object.active_shape_key_index
+        key_blocks = shape_keys.key_blocks
+        if 0 <= index < len(key_blocks):
+            return key_blocks[index].name
+        return None
+
+    def read_shape_key(self, shape_key_name):
+        """读取指定形态键坐标 (V, 3);不存在或顶点数与快照不符返回 None。"""
+        def build():
+            shape_keys = self.object.data.shape_keys
+            if shape_keys is None:
+                return None
+            key_block = shape_keys.key_blocks.get(shape_key_name)
+            if key_block is None:
+                return None
+            count = len(key_block.data)
+            if count != self.vertex_count:
+                return None
+            return read_shape_key_positions(key_block, count)
+        return self._cached(("shape_key", shape_key_name), build)
 
     # ---------- 顶点组 ----------
 
