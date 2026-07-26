@@ -253,6 +253,14 @@ class VIEW3D_PT_mesh_surface_conformer(ConformerPanelMixin, Panel):
                                basis, source, "Source", source_name)
             _draw_channel_name(column, settings, "match_basis_name_target",
                                basis, target_object, "Target", target_name)
+            # 搜索框留空时看不出真正用了哪一层,这里把解析结果摊开说 ——
+            # 两边指到不同的层正是"目标被吸成一团"的头号原因。
+            if source_name or target_name:
+                info = column.column(align=True)
+                info.label(
+                    text=f"Matching {_quoted(source_name).strip()} → "
+                         f"{_quoted(target_name).strip()}",
+                    icon='CHECKMARK' if source_name == target_name else 'ERROR')
         if basis not in ('TOPOLOGY', 'CUSTOM'):
             layout.prop(settings, "match_method", text="Method")
             if settings.match_method == 'PROJECTED' and basis != POSITION:

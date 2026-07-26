@@ -221,7 +221,7 @@ class ConformSession:
         return self._cached_match("source_kd", build)
 
     def _read_basis_values(self, snapshot, kind, name, is_target):
-        """把基准通道读成匹配空间里的 (N, 3) 点 + 它的域。
+        """把基准通道读成匹配空间里的 (N, 3) 点。返回 (值, 域, 层名, 分量数)。
 
         位置/方向类通道按各自物体的矩阵进匹配空间,其余通道原样使用 ——
         源与目标读的是同一个通道,量纲天然对齐。
@@ -239,10 +239,28 @@ class ConformSession:
         elif channel_data.directional:
             values = (self._match_space_target_normals(values) if is_target
                       else self._match_space_source_normals(values))
-        return lift_to_match_space(values), channel_data.domain, channel_data.name
+        return (lift_to_match_space(values), channel_data.domain,
+                channel_data.name, channel_data.components)
+
+    @staticmethod
+    def _value_extent(values):
+        """一组匹配空间点的包围盒对角线长度 = 这个基准"有多大"。"""
+        if values.shape[0] == 0:
+            return 0.0
+        return float(np.linalg.norm(values.max(axis=0) - values.min(axis=0)))
+
+    def _require_basis_extent(self, extent, kind, name, components, side):
+        """基准整体塌成一个点时必须当场报错 —— 否则所有查询都命中同一处,
+        表现就是目标网格被吸成一个点(旧版对 UV 有这道闸,泛化后必须保留)。"""
+        if components < 2 or extent > 1e-12:
+            return
+        raise ConformError(
+            f"{side} {channel_label(kind).lower()} '{name}' has no extent — every "
+            f"element would match the same spot. Pick the layer you actually "
+            f"unwrapped / painted")
 
     def _get_basis_surface(self, kind):
-        """源侧基准空间的三角形 BVH。返回 (surface, domain)。
+        """源侧基准空间的三角形 BVH。返回 (surface, domain, extent)。
 
         顶点域基准 → BVH 顶点池是逐顶点值,三角形用顶点索引(基准=位置时就是普通 3D 表面);
         角点域基准 → BVH 顶点池是逐角点值,三角形用 loop 索引(基准=UV 时就是 UV 空间),
@@ -250,25 +268,38 @@ class ConformSession:
         """
         def build():
             source = self.source_snapshot
-            values, domain, _name = self._read_basis_values(
+            values, domain, name, components = self._read_basis_values(
                 source, kind, self.settings.match_basis_name_source, is_target=False)
+            extent = self._value_extent(values)
+            self._require_basis_extent(extent, kind, name, components, "Source")
             triangle_vertices = source.triangle_vertex_indices
             triangle_loops = source.triangle_loop_indices
             if triangle_vertices.shape[0] == 0:
                 raise ConformError("Source mesh has no faces to match against")
             if domain == POINT:
-                return SurfaceCorrespondence(
-                    values, triangle_vertices, triangle_vertices, triangle_loops), domain
+                return (SurfaceCorrespondence(
+                    values, triangle_vertices, triangle_vertices, triangle_loops),
+                    domain, extent)
             corners = values[triangle_loops]
             doubled_area = np.linalg.norm(
                 np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]),
                 axis=1)
-            # 一维基准(如单通道属性)整层都在一条线上,零面积是常态,不能剔。
-            keep = (doubled_area > 1e-14 if np.any(doubled_area > 1e-14)
-                    else np.ones(doubled_area.shape[0], dtype=bool))
-            return SurfaceCorrespondence(
+            keep = doubled_area > 1e-14
+            if np.any(keep):
+                # 有面撑得开面积 → 零面积的那些是"没展开的面",留着会把查询全吸过去。
+                degenerate_count = int(np.count_nonzero(~keep))
+                if degenerate_count:
+                    self.warnings.append(
+                        f"{degenerate_count:,} source faces have zero area in "
+                        f"'{name}' and were left out of the matching space")
+            else:
+                # 一个面也撑不开:一维基准、或平面着色的法线(整面共用一个法线)。
+                # 此时插值本就无意义,全留着让重心退化成"取值最接近的那个角",
+                # 这仍是有效匹配 —— 真正致命的"整层塌成一点"已由 extent 闸拦下。
+                keep = np.ones(doubled_area.shape[0], dtype=bool)
+            return (SurfaceCorrespondence(
                 values, triangle_loops[keep], triangle_vertices[keep],
-                triangle_loops[keep]), domain
+                triangle_loops[keep]), domain, extent)
         return self._cached_match(("basis_surface", kind), build)
 
     def _basis_source_name(self, kind):
@@ -286,8 +317,10 @@ class ConformSession:
             target_name = resolve_match_name(
                 self.target_snapshot, kind, self.settings.match_basis_name_target,
                 self._basis_source_name(kind))
-            values, target_domain, _name = self._read_basis_values(
+            values, target_domain, name, components = self._read_basis_values(
                 self.target_snapshot, kind, target_name, is_target=True)
+            self._require_basis_extent(
+                self._value_extent(values), kind, name, components, "Target")
             if target_domain != domain:
                 # 两侧同一通道却落在不同域(颜色属性可点可角),折算到源侧的域再匹配。
                 bridge = SourceDomainBridge(
@@ -296,6 +329,40 @@ class ConformSession:
                 values = bridge.to_domain(values, target_domain, domain)
             return values
         return self._cached_match(("target_basis", kind), build)
+
+    def _warn_if_collapsed(self, original, result):
+        """结果尺寸相对原尺寸暴缩 = "匹配空间没对上"的直接证据,必须当场喊出来。
+
+        距离检测抓不到这一类:目标的 UV 若被打包进源 UV 的一个小角落,查询点全都
+        落在源面"内部",命中距离为零,但采到的却是源上极小一块 —— 表现就是整个
+        网格缩成一团。拿结果本身的包围盒比才抓得住。
+        """
+        if original.shape[0] < 4:
+            return
+        before = self._value_extent(original)
+        after = self._value_extent(result)
+        if before <= 1e-9 or after >= before * 0.02:
+            return
+        self.warnings.append(
+            f"Result shrank to {after / before:.1%} of the target's size — the two "
+            f"sides of the matching basis probably do not line up (check that both "
+            f"point at the same layer)")
+
+    def _warn_if_basis_far(self, kind, distances, valid, extent):
+        """两侧基准明明是"同一份数据"就该几乎零距离命中。
+
+        平均命中距离相对基准尺寸偏大 = 十有八九两边指的不是同一层
+        (源用 UVMap、目标用了另一套光照 UV),这正是"目标被吸成一小团"的成因。
+        """
+        if extent <= 1e-12 or not np.any(valid):
+            return
+        mean_distance = float(np.mean(distances[valid]))
+        if mean_distance <= extent * 0.05:
+            return
+        self.warnings.append(
+            f"Target values sit {mean_distance / extent:.0%} of the basis size away "
+            f"from the source {channel_label(kind).lower()} on average — check that "
+            f"both sides really point at the same layer")
 
     def _corner_query_geometry(self, values=None):
         """(导向偏置查询点, 真实角点值),都在匹配空间。
@@ -391,7 +458,7 @@ class ConformSession:
         同一顶点的多份角点值(接缝)因此必然收敛到唯一结果。
         """
         target = self.target_snapshot
-        surface, domain = self._get_basis_surface(kind)
+        surface, domain, extent = self._get_basis_surface(kind)
         values = self._get_target_basis_values(kind, domain)
         max_distance = self._search_max_distance()
 
@@ -401,6 +468,7 @@ class ConformSession:
             # 顶点域权重用命中点 + 内钳:采样结果必须落在源面上。
             rows = surface.resolve(
                 triangle_indices, hit_positions, distances, clamp_inside=True)
+            self._warn_if_basis_far(kind, distances, rows.valid, extent)
             if nearest:
                 rows = rows.as_nearest()
             return DirectVertexCorrespondence(rows)
@@ -414,6 +482,7 @@ class ConformSession:
             values[first_indices], max_distance)
         rows = surface.resolve(
             triangle_indices, hit_positions, distances, clamp_inside=True)
+        self._warn_if_basis_far(kind, distances, rows.valid, extent)
         if nearest:
             rows = rows.as_nearest()
         return CombinedVertexCorrespondence(
@@ -555,7 +624,7 @@ class ConformSession:
         顶点域基准 → 角点取所属顶点的基准值,导向偏置决定命中面(接缝两侧各归各的面)。
         """
         target = self.target_snapshot
-        surface, domain = self._get_basis_surface(kind)
+        surface, domain, extent = self._get_basis_surface(kind)
         values = self._get_target_basis_values(kind, domain)
         max_distance = self._search_max_distance()
 
@@ -566,6 +635,7 @@ class ConformSession:
                 nudged, max_distance)
             rows = surface.resolve(
                 triangle_indices, exact_values, distances, clamp_inside=False)
+            self._warn_if_basis_far(kind, distances, rows.valid, extent)
         else:
             first_indices, inverse_indices = deduplicate_queries(values)
             queries = values[first_indices]
@@ -573,6 +643,7 @@ class ConformSession:
                 queries, max_distance)
             rows = surface.resolve(
                 triangle_indices, queries, distances, clamp_inside=False)
+            self._warn_if_basis_far(kind, distances, rows.valid, extent)
             rows = rows.expand(inverse_indices)
         if nearest:
             rows = rows.as_nearest()
@@ -745,6 +816,8 @@ class ConformSession:
                 sampled, source_positions, correspondence.valid)
         mapped = transform_points(sampled, self._position_matrix)
         original = self.target_snapshot.vertex_positions
+        self._warn_if_collapsed(original[correspondence.valid],
+                                mapped[correspondence.valid])
 
         if settings.shape_as_shape_key:
             key_block, _created = ensure_shape_key(
@@ -1130,6 +1203,11 @@ class ConformSession:
             # 数值一律按"所选空间"解释:世界模式下 UV / 颜色等非位置数据也被当成
             # 世界坐标写回,所以 UV → 形态键就是把 UV 布局摊在世界的 1×1 方格里。
             result = self._match_space_to_target_positions(result)
+            if source_data.positional:
+                # 位置转位置才谈得上"塌缩";UV→顶点这类本来就该变形状,不适用。
+                valid = correspondence.valid
+                self._warn_if_collapsed(
+                    self.target_snapshot.vertex_positions[valid], result[valid])
         elif target_kind in DIRECTIONAL_CHANNELS:
             result = self._match_space_to_target_normals(result)
 
