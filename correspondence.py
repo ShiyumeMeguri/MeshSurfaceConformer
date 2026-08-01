@@ -495,27 +495,80 @@ class TopologyCornerCorrespondence:
         return self._bridge.to_domain(data, domain, CORNER).copy()
 
 
-def exact_value_matches(source_values, target_values):
-    """目标基准值与源基准值逐位相同 → 返回那个源元素的索引,没有则 -1。
+def match_corners_by_face_values(source_values, source_loop_starts, source_loop_totals,
+                                 target_values, target_loop_starts, target_loop_totals,
+                                 target_loop_count):
+    """按整张面的基准值组合配对源面与目标面,再在面内按值配对角点。
+
+    单个值会撞车(两个顶点共用同一个 UV 坐标,点级无论如何都分不出该去哪一个),
+    整张面的值组合撞车则几乎不可能 —— 判据升一级就能解开点级解不开的歧义,
+    拓扑一致时逐角点精确。返回 target_loop → source_loop,没配上为 -1。
+    """
+    source = np.asarray(source_values, dtype=np.float64)
+    target = np.asarray(target_values, dtype=np.float64)
+    source_rows = [row.tobytes() for row in source]
+    target_rows = [row.tobytes() for row in target]
+
+    lookup = {}
+    for face in range(source_loop_starts.shape[0]):
+        start = int(source_loop_starts[face])
+        total = int(source_loop_totals[face])
+        key = (total, b"".join(sorted(source_rows[start:start + total])))
+        lookup.setdefault(key, (start, total))
+
+    result = np.full(target_loop_count, -1, dtype=np.int64)
+    for face in range(target_loop_starts.shape[0]):
+        start = int(target_loop_starts[face])
+        total = int(target_loop_totals[face])
+        key = (total, b"".join(sorted(target_rows[start:start + total])))
+        entry = lookup.get(key)
+        if entry is None:
+            continue
+        source_start, source_total = entry
+        used = [False] * source_total
+        for offset in range(total):
+            target_loop = start + offset
+            value = target_rows[target_loop]
+            for source_offset in range(source_total):
+                if used[source_offset]:
+                    continue
+                if source_rows[source_start + source_offset] == value:
+                    used[source_offset] = True
+                    result[target_loop] = source_start + source_offset
+                    break
+    return result
+
+
+def exact_value_groups(source_values, target_values):
+    """把源与目标的基准值按"逐位相同"分组。
+
+    返回 (member_offsets, members, target_group):
+      members[member_offsets[g]:member_offsets[g + 1]] = 第 g 组的全部源元素索引,
+      target_group[i] = 目标元素 i 落在哪一组(源上没有这个值则 -1)。
 
     基准匹配的定义就是"值相同即同一处",所以值查找才是第一手依据,几何查询只是
-    值对不上时的退路。UV 岛重叠处同一个坐标被多个源三角形覆盖、命中距离全为 0,
-    几何查询挑中哪个纯看 BVH 遍历顺序;值查找没有这个歧义,对零面积面与接缝一样成立。
+    值对不上时的退路 —— UV 岛重叠处同一坐标被多个源三角形覆盖、命中距离全为 0,
+    几何查询挑中哪个纯看 BVH 遍历顺序。同一个值仍可能落在多个源元素上
+    (两个岛的顶点撞在同一 UV),那是真歧义,交给调用方按上下文决胜。
     """
     source = np.asarray(source_values, dtype=np.float64)
     target = np.asarray(target_values, dtype=np.float64)
     source_count = source.shape[0]
-    if source_count == 0 or target.shape[0] == 0:
-        return np.full(target.shape[0], -1, dtype=np.int64)
+    target_count = target.shape[0]
+    zero = np.zeros(1, dtype=np.int64)
+    if source_count == 0 or target_count == 0:
+        return (zero, np.empty(0, dtype=np.int64),
+                np.full(target_count, -1, dtype=np.int64))
     combined = np.concatenate((source, target), axis=0)
     _unique_rows, inverse_indices = np.unique(combined, axis=0, return_inverse=True)
     inverse_indices = inverse_indices.reshape(-1)
-    first_source = np.full(int(inverse_indices.max()) + 1, -1, dtype=np.int64)
-    # 逆序赋值 → 同值命中序号最小的源元素,结果与遍历顺序无关、可复现。
+    group_count = int(inverse_indices.max()) + 1
     source_ids = inverse_indices[:source_count]
-    first_source[source_ids[::-1]] = np.arange(
-        source_count - 1, -1, -1, dtype=np.int64)
-    return first_source[inverse_indices[source_count:]]
+    members = np.argsort(source_ids, kind='stable')
+    counts = np.bincount(source_ids, minlength=group_count)
+    member_offsets = np.concatenate((zero, np.cumsum(counts)))
+    target_ids = inverse_indices[source_count:]
+    return member_offsets, members, np.where(counts[target_ids] > 0, target_ids, -1)
 
 
 def deduplicate_queries(query_points):

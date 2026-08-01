@@ -41,7 +41,8 @@ from .correspondence import (
     DirectCornerCorrespondence,
     TopologyCornerCorrespondence,
     deduplicate_queries,
-    exact_value_matches,
+    exact_value_groups,
+    match_corners_by_face_values,
     snap_positions_to_nearest,
     build_kd_tree,
     query_kd_nearest,
@@ -269,25 +270,94 @@ class ConformSession:
                 is_target=False)
         return self._cached_match(("source_basis", kind), build)
 
+    def _source_element_positions(self, domain):
+        """源元素(角点域=loop,顶点域=vertex)各自的匹配空间位置,用于歧义决胜。"""
+        positions = self._get_source_match_positions()
+        if domain == CORNER:
+            return positions[self.source_snapshot.loop_vertex_indices]
+        return positions
+
+    def _resolve_value_ambiguity(self, chosen, ambiguous_rows, member_offsets, members,
+                                 target_group, element_positions, domain):
+        """同一个基准值落在多个源元素上时,按目标自身的面上下文决胜。
+
+        同面的其他角点已经唯一确定了落点,取离那个锚点最近的候选 —— 两个 UV 岛
+        撞在同一坐标时,只有这样才选得回本来那一侧;逐元素单看是无解的。
+        """
+        if domain != CORNER:
+            for row in ambiguous_rows.tolist():
+                group = target_group[row]
+                chosen[row] = members[member_offsets[group]]
+            return chosen
+        target = self.target_snapshot
+        face_of_loop = target.loop_polygon_indices
+        face_count = len(target.mesh.polygons)
+        settled = chosen >= 0
+        anchor_counts = np.bincount(
+            face_of_loop[settled], minlength=face_count).astype(np.float64)
+        settled_positions = element_positions[chosen[settled]]
+        anchor_sums = np.zeros((face_count, settled_positions.shape[1]))
+        for channel in range(settled_positions.shape[1]):
+            anchor_sums[:, channel] = np.bincount(
+                face_of_loop[settled], weights=settled_positions[:, channel],
+                minlength=face_count)
+        anchors = anchor_sums / np.maximum(anchor_counts, 1.0)[:, None]
+        for row in ambiguous_rows.tolist():
+            group = target_group[row]
+            candidates = members[member_offsets[group]:member_offsets[group + 1]]
+            face = face_of_loop[row]
+            if anchor_counts[face] > 0.0:
+                offsets = element_positions[candidates] - anchors[face]
+                chosen[row] = candidates[
+                    np.argmin(np.einsum('ij,ij->i', offsets, offsets))]
+            else:
+                chosen[row] = candidates[0]
+        return chosen
+
     def _apply_exact_basis_matches(self, rows, surface, kind, domain, target_values):
         """基准值与源逐位相同的目标元素,直接对到那个源元素,不走几何查询。
 
         源 UV 有重叠时同一坐标被多个源三角形覆盖、命中距离全为 0,几何查询挑中哪个
         纯看 BVH 遍历顺序,必然采错一部分;值相同就是同一处,先按值定死才是对的。
+        一个值仍对应多个源元素时按面上下文决胜(见 _resolve_value_ambiguity)。
         """
         source_values, _domain, _name, _components = self._get_source_basis_values(kind)
-        matched = exact_value_matches(source_values, target_values)
-        found = matched >= 0
+        member_offsets, members, target_group = exact_value_groups(
+            source_values, target_values)
+        found = target_group >= 0
         if not np.any(found):
             return rows
+        safe_group = np.where(found, target_group, 0)
+        candidate_counts = np.where(
+            found, member_offsets[safe_group + 1] - member_offsets[safe_group], 0)
+        if domain == CORNER:
+            # 先按整张面的值组合配对 —— 判据比单个值强得多,点级撞车在这里就解开了。
+            chosen = match_corners_by_face_values(
+                source_values, self.source_snapshot.polygon_loop_starts,
+                self.source_snapshot.polygon_loop_totals,
+                target_values, self.target_snapshot.polygon_loop_starts,
+                self.target_snapshot.polygon_loop_totals,
+                target_group.shape[0])
+        else:
+            chosen = np.full(target_group.shape[0], -1, dtype=np.int64)
+        pending = chosen < 0
+        unique_hit = pending & found & (candidate_counts == 1)
+        chosen[unique_hit] = members[member_offsets[target_group[unique_hit]]]
+        ambiguous_rows = np.nonzero(pending & found & (candidate_counts > 1))[0]
+        if ambiguous_rows.shape[0]:
+            chosen = self._resolve_value_ambiguity(
+                chosen, ambiguous_rows, member_offsets, members, target_group,
+                self._source_element_positions(domain), domain)
+
         slots = surface.element_slots(domain, source_values.shape[0])
-        slot = np.full(matched.shape[0], -1, dtype=np.int64)
-        slot[found] = slots[matched[found]]
+        settled = chosen >= 0
+        slot = np.full(chosen.shape[0], -1, dtype=np.int64)
+        slot[settled] = slots[chosen[settled]]
         usable = slot >= 0
         if not np.any(usable):
             return rows
         self._exact_match_counts[kind] = (int(np.count_nonzero(usable)),
-                                          int(matched.shape[0]))
+                                          int(chosen.shape[0]))
         target_rows = np.nonzero(usable)[0]
         return rows.with_forced_elements(
             target_rows, slot[usable] // 3, slot[usable] % 3)
