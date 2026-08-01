@@ -1,5 +1,5 @@
-# 算子层:遵循 Blender 官方 Link/Transfer Data 约定 —— 活动物体是源,
-# 其余选中网格是目标,无需手动指定源;设置读自 Scene 级 PropertyGroup。
+# 算子层:活动物体 = 被修改的目标,另一个选中的网格 = 源
+# (最后选中的就是要动的那个);设置读自 Scene 级 PropertyGroup。
 # 转换模式额外允许"只选一个物体"= 就地把自己的一个通道转成另一个通道。
 # 引擎全程纯数据操作(无 bpy.ops),唯一的模式切换用于把编辑模式选择/几何冲刷回网格。
 
@@ -29,19 +29,28 @@ def _any_data_type_enabled(settings):
     return any(getattr(settings, name) for name in _DATA_TOGGLES)
 
 
-def gather_source_and_targets(context, allow_self=False):
-    """活动物体 = 源,其余选中网格 = 目标(与 object.data_transfer 同一约定)。
+def other_selected_meshes(context, active):
+    return [candidate for candidate in context.selected_objects
+            if candidate.type == 'MESH' and candidate != active]
 
-    allow_self=True 且没有别的选中网格时,目标就是源自己(就地转换)。
+
+def gather_source_and_targets(context, allow_self=False):
+    """活动物体 = 被修改的目标,另一个选中的网格 = 源。
+
+    最后选中的(活动物体)就是要动的那个 —— 与 Ctrl+L / object.data_transfer 相反,
+    那套约定把活动物体当源,读起来是反的。
+    源必须唯一:Blender 不保留选择顺序,选中三个以上就无从判断谁是源。
+    allow_self=True 且没有别的选中网格时,目标就是自己(就地转换)。
     """
-    source = context.active_object
-    if source is None or source.type != 'MESH':
+    target = context.active_object
+    if target is None or target.type != 'MESH':
         return None, []
-    targets = [candidate for candidate in context.selected_objects
-               if candidate.type == 'MESH' and candidate != source]
-    if not targets and allow_self:
-        targets = [source]
-    return source, targets
+    sources = other_selected_meshes(context, target)
+    if not sources:
+        return (target, [target]) if allow_self else (None, [])
+    if len(sources) > 1:
+        return None, []
+    return sources[0], [target]
 
 
 class OBJECT_OT_mesh_surface_conform(Operator):
@@ -54,12 +63,19 @@ class OBJECT_OT_mesh_surface_conform(Operator):
     def poll(cls, context):
         settings = context.scene.mesh_surface_conformer
         converting = settings.mode == 'CONVERT'
-        source, targets = gather_source_and_targets(context, allow_self=converting)
-        if source is None:
-            cls.poll_message_set("Active object must be a mesh")
+        active = context.active_object
+        if active is None or active.type != 'MESH':
+            cls.poll_message_set(
+                "Make the mesh you want to modify the active object")
             return False
-        if not targets:
-            cls.poll_message_set("Select the target meshes, then the source last")
+        if len(other_selected_meshes(context, active)) > 1:
+            cls.poll_message_set(
+                "Select exactly one source plus the mesh to modify")
+            return False
+        source, targets = gather_source_and_targets(context, allow_self=converting)
+        if source is None or not targets:
+            cls.poll_message_set(
+                "Select the source first, then the mesh to modify")
             return False
         if not converting and not _any_data_type_enabled(settings):
             cls.poll_message_set("Enable at least one data type")
@@ -172,11 +188,9 @@ class OBJECT_OT_mesh_surface_conform_drivers(Operator):
     @classmethod
     def poll(cls, context):
         source, targets = gather_source_and_targets(context)
-        if source is None:
-            cls.poll_message_set("Active object must be a mesh (the source)")
-            return False
-        if not targets:
-            cls.poll_message_set("Select the target meshes, then the source last")
+        if source is None or not targets:
+            cls.poll_message_set(
+                "Select the source first, then the mesh to modify")
             return False
         if source.data.shape_keys is None:
             cls.poll_message_set("Source has no shape keys")

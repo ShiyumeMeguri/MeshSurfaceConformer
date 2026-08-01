@@ -26,7 +26,7 @@ from .channels import (
     resolve_source_name,
 )
 from .mesh_buffers import MeshBufferSnapshot, attribute_component_count
-from .operators import gather_source_and_targets
+from .operators import gather_source_and_targets, other_selected_meshes
 from .properties import (
     NAMED_MATCH_BASES,
     resolved_corner_mapping,
@@ -154,6 +154,17 @@ def _quoted(name):
     return f" '{name}'" if name else ""
 
 
+def _channel_exists(mesh_object, kind, name):
+    """该物体上有没有这个名字的层/组/键 —— 唯一值得报错的情况。
+    两边指到不同名字的层是正常用法(以任意一层为基准匹配另一层),不是错误。"""
+    if mesh_object is None or not name:
+        return True
+    snapshot = MeshBufferSnapshot(mesh_object)
+    if kind == SHAPE_KEY:
+        return name in snapshot.shape_key_names
+    return name in channel_names(snapshot, kind)
+
+
 def _component_hint(settings, source_components, target_components):
     """把引擎真正会做的分量重排显示出来 —— 直接拿探针跑一遍引擎函数,永不与实现失同步。"""
     if source_components <= 0 or target_components <= 0:
@@ -193,7 +204,7 @@ class VIEW3D_PT_mesh_surface_conformer(ConformerPanelMixin, Panel):
         row.scale_y = 1.2
         row.prop(settings, "mode", expand=True)
 
-        self._draw_status(layout, source, targets, converting, in_place)
+        self._draw_status(layout, context, source, targets, converting, in_place)
 
         layout.use_property_split = True
         layout.use_property_decorate = False
@@ -215,29 +226,32 @@ class VIEW3D_PT_mesh_surface_conformer(ConformerPanelMixin, Panel):
             icon='ARROW_LEFTRIGHT' if converting else 'MOD_DATA_TRANSFER')
 
     @staticmethod
-    def _draw_status(layout, source, targets, converting, in_place):
+    def _draw_status(layout, context, source, targets, converting, in_place):
         box = layout.box()
         column = box.column(align=True)
-        if source is None:
-            column.label(text="Make a mesh the active object", icon='ERROR')
-            return
-        if not targets:
-            column.label(text=f"Source: {source.name}", icon='OBJECT_DATA')
-            column.label(text="Now select the targets too", icon='INFO')
+        active = context.active_object
+        if active is None or active.type != 'MESH':
+            column.label(text="Make the mesh you want to modify the active object",
+                         icon='ERROR')
             return
         if in_place:
-            column.label(text=f"In place on: {source.name}", icon='OBJECT_DATA')
+            column.label(text=f"In place on: {active.name}", icon='OBJECT_DATA')
             column.label(text="Matched by index — add a 2nd mesh to copy across",
                          icon='MESH_GRID')
             return
-        if len(targets) == 1:
-            column.label(text=f"{source.name}  →  {targets[0].name}",
-                         icon='FORWARD')
-        else:
-            column.label(text=f"{source.name}  →  {len(targets)} meshes",
-                         icon='FORWARD')
-        if not converting:
-            column.label(text="Active object is the source", icon='INFO')
+        if source is None:
+            others = other_selected_meshes(context, active)
+            if len(others) > 1:
+                column.label(text=f"{len(others)} possible sources selected",
+                             icon='ERROR')
+                column.label(text="Select exactly one source plus the mesh to modify",
+                             icon='INFO')
+            else:
+                column.label(text=f"Modifying: {active.name}", icon='OBJECT_DATA')
+                column.label(text="Now also select the source mesh", icon='INFO')
+            return
+        column.label(text=f"{source.name}  →  {targets[0].name}", icon='FORWARD')
+        column.label(text="Active object is the one being modified", icon='INFO')
 
     @staticmethod
     def _draw_match(layout, settings, source, targets):
@@ -253,14 +267,24 @@ class VIEW3D_PT_mesh_surface_conformer(ConformerPanelMixin, Panel):
                                basis, source, "Source", source_name)
             _draw_channel_name(column, settings, "match_basis_name_target",
                                basis, target_object, "Target", target_name)
-            # 搜索框留空时看不出真正用了哪一层,这里把解析结果摊开说 ——
-            # 两边指到不同的层正是"目标被吸成一团"的头号原因。
+            # 搜索框留空时看不出真正用了哪一层,这里把解析结果摊开说。
+            # 只有"这一层根本不存在"才是错误;名字不同是正常的跨层匹配。
             if source_name or target_name:
+                source_missing = not _channel_exists(source, basis, source_name)
+                target_missing = not _channel_exists(target_object, basis, target_name)
                 info = column.column(align=True)
-                info.label(
-                    text=f"Matching {_quoted(source_name).strip()} → "
-                         f"{_quoted(target_name).strip()}",
-                    icon='CHECKMARK' if source_name == target_name else 'ERROR')
+                if source_missing or target_missing:
+                    side = ("source and target" if source_missing and target_missing
+                            else "source" if source_missing else "target")
+                    info.label(
+                        text=f"The {side} has no "
+                             f"{channel_label(basis).lower()} by that name",
+                        icon='ERROR')
+                else:
+                    info.label(
+                        text=f"Matching {_quoted(source_name).strip()} → "
+                             f"{_quoted(target_name).strip()}",
+                        icon='CHECKMARK')
         if basis not in ('TOPOLOGY', 'CUSTOM'):
             layout.prop(settings, "match_method", text="Method")
             if settings.match_method == 'PROJECTED' and basis != POSITION:
