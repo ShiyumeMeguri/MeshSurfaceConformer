@@ -41,6 +41,7 @@ from .correspondence import (
     DirectCornerCorrespondence,
     TopologyCornerCorrespondence,
     deduplicate_queries,
+    exact_value_matches,
     snap_positions_to_nearest,
     build_kd_tree,
     query_kd_nearest,
@@ -122,6 +123,7 @@ class ConformSession:
         self._corner_correspondence = None
         self._vertex_influence_base = None
         self._influence_cache = {}
+        self._exact_match_counts = {}
         self.warnings = []
         self.summaries = []
 
@@ -259,6 +261,37 @@ class ConformSession:
             f"element would match the same spot. Pick the layer you actually "
             f"unwrapped / painted")
 
+    def _get_source_basis_values(self, kind):
+        """源侧基准值(匹配空间,已升到 3 分量),供几何建树与精确值匹配共用。"""
+        def build():
+            return self._read_basis_values(
+                self.source_snapshot, kind, self.settings.match_basis_name_source,
+                is_target=False)
+        return self._cached_match(("source_basis", kind), build)
+
+    def _apply_exact_basis_matches(self, rows, surface, kind, domain, target_values):
+        """基准值与源逐位相同的目标元素,直接对到那个源元素,不走几何查询。
+
+        源 UV 有重叠时同一坐标被多个源三角形覆盖、命中距离全为 0,几何查询挑中哪个
+        纯看 BVH 遍历顺序,必然采错一部分;值相同就是同一处,先按值定死才是对的。
+        """
+        source_values, _domain, _name, _components = self._get_source_basis_values(kind)
+        matched = exact_value_matches(source_values, target_values)
+        found = matched >= 0
+        if not np.any(found):
+            return rows
+        slots = surface.element_slots(domain, source_values.shape[0])
+        slot = np.full(matched.shape[0], -1, dtype=np.int64)
+        slot[found] = slots[matched[found]]
+        usable = slot >= 0
+        if not np.any(usable):
+            return rows
+        self._exact_match_counts[kind] = (int(np.count_nonzero(usable)),
+                                          int(matched.shape[0]))
+        target_rows = np.nonzero(usable)[0]
+        return rows.with_forced_elements(
+            target_rows, slot[usable] // 3, slot[usable] % 3)
+
     def _get_basis_surface(self, kind):
         """源侧基准空间的三角形 BVH。返回 (surface, domain, extent)。
 
@@ -268,8 +301,7 @@ class ConformSession:
         """
         def build():
             source = self.source_snapshot
-            values, domain, name, components = self._read_basis_values(
-                source, kind, self.settings.match_basis_name_source, is_target=False)
+            values, domain, name, components = self._get_source_basis_values(kind)
             extent = self._value_extent(values)
             self._require_basis_extent(extent, kind, name, components, "Source")
             triangle_vertices = source.triangle_vertex_indices
@@ -471,6 +503,8 @@ class ConformSession:
             self._warn_if_basis_far(kind, distances, rows.valid, extent)
             if nearest:
                 rows = rows.as_nearest()
+            rows = self._apply_exact_basis_matches(
+                rows, surface, kind, domain, values)
             return DirectVertexCorrespondence(rows)
 
         if target.loop_count == 0:
@@ -485,8 +519,10 @@ class ConformSession:
         self._warn_if_basis_far(kind, distances, rows.valid, extent)
         if nearest:
             rows = rows.as_nearest()
+        rows = self._apply_exact_basis_matches(
+            rows.expand(inverse_indices), surface, kind, domain, values)
         return CombinedVertexCorrespondence(
-            rows.expand(inverse_indices),
+            rows,
             target.loop_vertex_indices,
             target.vertex_count)
 
@@ -636,6 +672,8 @@ class ConformSession:
             rows = surface.resolve(
                 triangle_indices, exact_values, distances, clamp_inside=False)
             self._warn_if_basis_far(kind, distances, rows.valid, extent)
+            rows = self._apply_exact_basis_matches(
+                rows, surface, kind, domain, corner_values)
         else:
             first_indices, inverse_indices = deduplicate_queries(values)
             queries = values[first_indices]
@@ -644,7 +682,8 @@ class ConformSession:
             rows = surface.resolve(
                 triangle_indices, queries, distances, clamp_inside=False)
             self._warn_if_basis_far(kind, distances, rows.valid, extent)
-            rows = rows.expand(inverse_indices)
+            rows = self._apply_exact_basis_matches(
+                rows.expand(inverse_indices), surface, kind, domain, values)
         if nearest:
             rows = rows.as_nearest()
         return DirectCornerCorrespondence(rows)

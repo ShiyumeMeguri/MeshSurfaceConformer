@@ -209,6 +209,22 @@ class CorrespondenceRows:
         gather = self._owner.triangle_corner_indices[self._triangle_indices]
         return np.einsum('nkc,nk->nc', data[gather], self._weights)
 
+    def with_forced_elements(self, target_rows, triangle_indices, corner_slots):
+        """指定行改成直取某个源三角形的某个角(one-hot 权重),不做任何插值。
+
+        基准值与源逐位相同的元素就该原样取那一处 —— 命中距离归零,权重不再参与插值。
+        """
+        weights = self._weights.copy()
+        weights[target_rows] = 0.0
+        weights[target_rows, corner_slots] = 1.0
+        triangles = self._triangle_indices.copy()
+        triangles[target_rows] = triangle_indices
+        valid = self.valid.copy()
+        valid[target_rows] = True
+        distances = self.distances.copy()
+        distances[target_rows] = 0.0
+        return CorrespondenceRows(valid, triangles, weights, distances, self._owner)
+
     def as_nearest(self):
         """把重心权重塌成命中三角形里最近那个角的 one-hot。
 
@@ -226,7 +242,7 @@ class SurfaceCorrespondence:
     """源表面的三角形查询结构:一次构建,多次查询/采样。"""
 
     __slots__ = ("triangle_count", "triangle_vertex_indices", "triangle_corner_indices",
-                 "_triangle_corner_positions", "_bvh_tree")
+                 "_triangle_corner_positions", "_bvh_tree", "_element_slots")
 
     def __init__(self, bvh_positions, bvh_triangles, triangle_vertex_indices, triangle_corner_indices):
         """
@@ -242,6 +258,22 @@ class SurfaceCorrespondence:
         self._triangle_corner_positions = bvh_positions[bvh_triangles]
         self._bvh_tree = BVHTree.FromPolygons(
             bvh_positions.tolist(), bvh_triangles.tolist(), all_triangles=True)
+        self._element_slots = {}
+
+    def element_slots(self, domain, element_count):
+        """源元素 → 含它的某个角在三角形数组里的扁平位置(slot//3 = 三角形, slot%3 = 角)。
+
+        没有被任何三角形用到的元素(如整面零面积被剔除)返回 -1,调用方据此退回几何查询。
+        """
+        key = (domain, element_count)
+        if key not in self._element_slots:
+            table = (self.triangle_corner_indices if domain == CORNER
+                     else self.triangle_vertex_indices)
+            slots = np.full(element_count, -1, dtype=np.int64)
+            flat = table.ravel()
+            slots[flat] = np.arange(flat.shape[0], dtype=np.int64)
+            self._element_slots[key] = slots
+        return self._element_slots[key]
 
     def query_nearest(self, query_points, max_distance=None):
         """最近表面点查询。返回 (triangle_indices, hit_positions, distances),未命中行 index=-1。"""
@@ -461,6 +493,29 @@ class TopologyCornerCorrespondence:
 
     def sample(self, data, domain=CORNER):
         return self._bridge.to_domain(data, domain, CORNER).copy()
+
+
+def exact_value_matches(source_values, target_values):
+    """目标基准值与源基准值逐位相同 → 返回那个源元素的索引,没有则 -1。
+
+    基准匹配的定义就是"值相同即同一处",所以值查找才是第一手依据,几何查询只是
+    值对不上时的退路。UV 岛重叠处同一个坐标被多个源三角形覆盖、命中距离全为 0,
+    几何查询挑中哪个纯看 BVH 遍历顺序;值查找没有这个歧义,对零面积面与接缝一样成立。
+    """
+    source = np.asarray(source_values, dtype=np.float64)
+    target = np.asarray(target_values, dtype=np.float64)
+    source_count = source.shape[0]
+    if source_count == 0 or target.shape[0] == 0:
+        return np.full(target.shape[0], -1, dtype=np.int64)
+    combined = np.concatenate((source, target), axis=0)
+    _unique_rows, inverse_indices = np.unique(combined, axis=0, return_inverse=True)
+    inverse_indices = inverse_indices.reshape(-1)
+    first_source = np.full(int(inverse_indices.max()) + 1, -1, dtype=np.int64)
+    # 逆序赋值 → 同值命中序号最小的源元素,结果与遍历顺序无关、可复现。
+    source_ids = inverse_indices[:source_count]
+    first_source[source_ids[::-1]] = np.arange(
+        source_count - 1, -1, -1, dtype=np.int64)
+    return first_source[inverse_indices[source_count:]]
 
 
 def deduplicate_queries(query_points):
