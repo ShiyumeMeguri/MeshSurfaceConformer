@@ -52,6 +52,7 @@ from .correspondence import (
 from .mesh_buffers import (
     MeshBufferSnapshot,
     add_numbered_shape_key,
+    add_numbered_uv_layer,
     apply_vertex_positions,
     read_shape_key_mix_positions,
     matrix_to_numpy,
@@ -1021,7 +1022,10 @@ class ConformSession:
             sampled = correspondence.sample(source_uv, CORNER)
             target_name, force_new = self._resolve_uv_target_name(
                 layer_name, settings.uv_transfer_all)
-            actual_name = ensure_uv_layer(target_mesh, target_name, force_new=force_new)
+            if force_new:
+                actual_name = add_numbered_uv_layer(target_mesh, target_name)
+            else:
+                actual_name = ensure_uv_layer(target_mesh, target_name)
             if actual_name is None:
                 self.warnings.append(
                     f"UV layer limit (8) reached — '{layer_name}' skipped")

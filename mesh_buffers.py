@@ -77,6 +77,20 @@ def ensure_uv_layer(mesh, layer_name, force_new=False):
     return created.name
 
 
+def add_numbered_uv_layer(mesh, base_name):
+    """新建 UV 层;名字被占用就顺延 .001/.002 —— 每次转换留下独立一层,不覆盖上一次。
+    超出 Blender 8 层上限返回 None。"""
+    if len(mesh.uv_layers) >= 8:
+        return None
+    name = base_name
+    ordinal = 1
+    while mesh.uv_layers.get(name) is not None:
+        name = f"{base_name}.{ordinal:03d}"
+        ordinal += 1
+    created = mesh.uv_layers.new(name=name, do_init=True)
+    return created.name if created is not None else None
+
+
 def read_color_attribute(mesh, attribute_name):
     """读取颜色属性。返回 (domain, data_type, (N, 4) float64);不存在返回 None。"""
     attribute = mesh.color_attributes.get(attribute_name)

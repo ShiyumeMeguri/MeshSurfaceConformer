@@ -8,6 +8,7 @@ import numpy as np
 
 from .correspondence import POINT, CORNER
 from .mesh_buffers import (
+    add_numbered_uv_layer,
     attribute_component_count,
     ensure_color_attribute,
     ensure_generic_attribute,
@@ -421,8 +422,9 @@ class TargetChannel:
         if kind == SHAPE_KEY:
             self._key_block, self.created = ensure_shape_key(target_object, self.name)
         elif kind == UV:
-            self.created = self.mesh.uv_layers.get(self.name) is None
-            actual_name = ensure_uv_layer(self.mesh, self.name)
+            # 与形态键同样的规矩:每次转换新建一层,绝不覆盖上一次的结果。
+            self.created = True
+            actual_name = add_numbered_uv_layer(self.mesh, self.name)
             if actual_name is None:
                 raise ChannelError("Target already has the maximum of 8 UV layers")
             self.name = actual_name

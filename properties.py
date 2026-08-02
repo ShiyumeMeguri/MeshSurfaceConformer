@@ -395,14 +395,15 @@ class MeshSurfaceConformerSettings(PropertyGroup):
         name="Write To",
         description="Where the transferred UVs are written on the target",
         items=[
-            ('MATCH_NAME', "Matching Name",
-             "Write into the target layer with the same name, creating it if needed", 0),
-            ('ACTIVE', "Active Layer",
-             "Write into the target's active UV layer (single-layer transfer only)", 1),
             ('NEW', "New Layer",
-             "Always create a new UV layer on the target", 2),
+             "Always add a new UV layer, numbered .001/.002 — the previous result is "
+             "never overwritten, same as how shape keys stack up", 0),
+            ('MATCH_NAME', "Matching Name",
+             "Overwrite the target layer with the same name, creating it if needed", 1),
+            ('ACTIVE', "Active Layer",
+             "Overwrite the target's active UV layer (single-layer transfer only)", 2),
         ],
-        default='MATCH_NAME',
+        default='NEW',
     )
 
     # ---------- 数据:颜色 ----------
