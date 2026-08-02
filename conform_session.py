@@ -51,7 +51,9 @@ from .correspondence import (
 )
 from .mesh_buffers import (
     MeshBufferSnapshot,
+    add_numbered_shape_key,
     apply_vertex_positions,
+    read_shape_key_mix_positions,
     matrix_to_numpy,
     transform_points,
     transform_directions,
@@ -94,10 +96,16 @@ class ConformSession:
         # 精确且不需要任何空间查询,所以强制走拓扑映射。
         self.same_object = source_object == target_object
 
+        # 目标一律按"当前可见形状"(形态键混合后)参与匹配与混合,这样每次应用都
+        # 接着上一次的结果继续推进,而不是每次都从静止态重来。
+        # 它会短暂增删一个形态键,必须赶在源求值网格建立之前做完。
+        target_mix = read_shape_key_mix_positions(target_object)
         depsgraph = context.evaluated_depsgraph_get() if settings.use_evaluated_source else None
         self.source_snapshot = MeshBufferSnapshot(
             source_object, settings.use_evaluated_source, depsgraph)
         self.target_snapshot = MeshBufferSnapshot(target_object)
+        if target_mix is not None:
+            self.target_snapshot.seed_vertex_positions(target_mix)
 
         if self.target_snapshot.vertex_count == 0:
             raise ConformError("Target mesh has no vertices")
@@ -929,15 +937,21 @@ class ConformSession:
                                 mapped[correspondence.valid])
 
         if settings.shape_as_shape_key:
-            key_block, _created = ensure_shape_key(
+            current = original
+            result = current + (mapped - current) * influence
+            mesh = self.target_object.data
+            if mesh.shape_keys is None:
+                self.target_object.shape_key_add(name="Basis", from_mix=False)
+            basis_positions = read_shape_key_positions(
+                mesh.shape_keys.key_blocks[0], self.target_snapshot.vertex_count)
+            key_block = add_numbered_shape_key(
                 self.target_object, f"{self.source_object.name}.Conformed")
-            vertex_count = self.target_snapshot.vertex_count
-            base_for_blend = read_shape_key_positions(key_block, vertex_count)
-            result = base_for_blend + (mapped - base_for_blend) * influence
-            write_shape_key_positions(key_block, result)
+            # 相对形态键是叠加的:存"相对当前可见形状的修正量",加上去正好得到目标形状,
+            # 已有形态键的值一个都不用动,再应用一次就在这一层之上继续推进。
+            write_shape_key_positions(key_block, basis_positions + (result - current))
             key_block.value = 1.0
             self.target_object.data.update()
-            return "Shape (as shape key)"
+            return f"Shape (shape key '{key_block.name}')"
 
         result = original + (mapped - original) * influence
         apply_vertex_positions(self.target_object, result)

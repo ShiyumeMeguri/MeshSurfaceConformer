@@ -236,6 +236,36 @@ def ensure_shape_key(target_object, shape_key_name):
     return key_block, True
 
 
+def read_shape_key_mix_positions(mesh_object):
+    """当前形态键混合后的顶点坐标(不经修改器,顶点数不变);没有形态键返回 None。
+
+    借 Blender 自己的 from_mix 求值,不重实现相对形态键/相对键/顶点组遮罩那一套。
+    会短暂增删一个形态键,所以必须在持有任何求值网格之前调用。
+    """
+    mesh = mesh_object.data
+    if mesh.shape_keys is None:
+        return None
+    temporary = mesh_object.shape_key_add(name="__conformer_mix__", from_mix=True)
+    try:
+        return read_shape_key_positions(temporary, len(mesh.vertices))
+    finally:
+        mesh_object.shape_key_remove(temporary)
+
+
+def add_numbered_shape_key(target_object, base_name):
+    """新建形态键;名字被占用就顺延 .001/.002 —— 每次应用留下独立一层,可持续迭代。"""
+    mesh = target_object.data
+    if mesh.shape_keys is None:
+        target_object.shape_key_add(name="Basis", from_mix=False)
+    key_blocks = mesh.shape_keys.key_blocks
+    name = base_name
+    ordinal = 1
+    while key_blocks.get(name) is not None:
+        name = f"{base_name}.{ordinal:03d}"
+        ordinal += 1
+    return target_object.shape_key_add(name=name, from_mix=False)
+
+
 def read_shape_key_positions(key_block, vertex_count):
     buffer = np.empty(vertex_count * 3, dtype=np.float32)
     key_block.data.foreach_get("co", buffer)
@@ -320,6 +350,10 @@ class MeshBufferSnapshot:
             value = builder()
             self._cache[key] = value
         return value
+
+    def seed_vertex_positions(self, positions):
+        """外部预先算好的顶点坐标(如形态键混合结果)直接喂进缓存,后续一律用它。"""
+        self._cache["vertex_positions"] = positions
 
     # ---------- 拓扑 ----------
 
