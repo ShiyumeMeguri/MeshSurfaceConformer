@@ -97,14 +97,19 @@ class ConformSession:
         # 精确且不需要任何空间查询,所以强制走拓扑映射。
         self.same_object = source_object == target_object
 
-        # 目标一律按"当前可见形状"(形态键混合后)参与匹配与混合,这样每次应用都
-        # 接着上一次的结果继续推进,而不是每次都从静止态重来。
-        # 它会短暂增删一个形态键,必须赶在源求值网格建立之前做完。
+        # 两边都按"当前可见形状"(形态键混合后)参与匹配:源上调了形态键就该按调完的
+        # 形状搬运,目标则接着上一次的结果继续推进,而不是每次都从静止态重来。
+        # 求值源自带形态键与修改器,不用也不能再叠这一层(顶点数已经变了)。
+        # 混合取值会短暂增删一个形态键,必须赶在源求值网格建立之前做完。
+        source_mix = (None if settings.use_evaluated_source
+                      else read_shape_key_mix_positions(source_object))
         target_mix = read_shape_key_mix_positions(target_object)
         depsgraph = context.evaluated_depsgraph_get() if settings.use_evaluated_source else None
         self.source_snapshot = MeshBufferSnapshot(
             source_object, settings.use_evaluated_source, depsgraph)
         self.target_snapshot = MeshBufferSnapshot(target_object)
+        if source_mix is not None:
+            self.source_snapshot.seed_vertex_positions(source_mix)
         if target_mix is not None:
             self.target_snapshot.seed_vertex_positions(target_mix)
 
