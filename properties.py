@@ -1,16 +1,13 @@
 # 插件设置:挂在 Scene 上的 PropertyGroup(工具型全局配置,配合"活动物体→选中物体"约定)。
 # 分三层暴露,越常用的越靠前:
-#   1. 模式(传输 / 转换)+ 匹配预设 —— 面板主区,平时只需要动这两项;
-#   2. 数据勾选 / 转换的"从 → 到" —— 主区第二行;
-#   3. 高级映射(与 Blender DataTransfer 修改器逐字对齐的顶点域 7 种 + 角点域 6 种,
-#      外加本插件独有的 UV Interpolated)、影响、各数据细项 —— 折叠子面板。
+#   1. 匹配基准(Match By)+ 方式(Method)—— 面板主区,平时只需要动这两项;
+#   2. 六个数据开关 + 四个快捷预设 —— 主区第二行;
+#   3. 各数据细项、影响、UV 镜像 —— 折叠子面板。
 
-import bpy
 from bpy.props import (
     BoolProperty,
     EnumProperty,
     FloatProperty,
-    PointerProperty,
     StringProperty,
 )
 from bpy.types import PropertyGroup
@@ -18,66 +15,13 @@ from bpy.types import PropertyGroup
 from .channels import (
     ATTRIBUTE,
     COLOR,
-    COMPONENT_SOURCE_ITEMS,
     NAMED_CHANNELS,
     NORMAL,
     POSITION,
     SHAPE_KEY,
-    SOURCE_CHANNEL_ITEMS,
-    TARGET_CHANNEL_ITEMS,
     UV,
-    VALUE_REMAP_ITEMS,
     WEIGHT,
 )
-from .mesh_buffers import ATTRIBUTE_TYPE_ITEMS
-
-
-def poll_armature(self, candidate):
-    return candidate.type == 'ARMATURE'
-
-
-# Blender rna_enum_dt_method_vertex_items 全集 + UV。
-_VERTEX_MAPPING_ITEMS = [
-    ('TOPOLOGY', "Topology",
-     "Copy from identical topology meshes", 0),
-    ('NEAREST', "Nearest Vertex",
-     "Copy from closest vertex", 1),
-    ('EDGE_NEAREST', "Nearest Edge Vertex",
-     "Copy from closest vertex of closest edge", 2),
-    ('EDGEINTERP_NEAREST', "Nearest Edge Interpolated",
-     "Copy from interpolated values of vertices from closest point on closest edge", 3),
-    ('POLY_NEAREST', "Nearest Face Vertex",
-     "Copy from closest vertex of closest face", 4),
-    ('POLYINTERP_NEAREST', "Nearest Face Interpolated",
-     "Copy from interpolated values of vertices from closest point on closest face", 5),
-    ('POLYINTERP_VNORPROJ', "Projected Face Interpolated",
-     "Copy from interpolated values of vertices from point on closest face hit "
-     "by normal-projection", 6),
-    ('UV', "UV Interpolated",
-     "Match through UV space: sample where each element's UV lands in the source "
-     "UV layout (unique to this add-on)", 7),
-]
-
-# Blender rna_enum_dt_method_loop_items 全集 + UV。
-_CORNER_MAPPING_ITEMS = [
-    ('TOPOLOGY', "Topology",
-     "Copy from identical topology meshes", 0),
-    ('NEAREST_NORMAL', "Nearest Corner and Best Matching Normal",
-     "Copy from nearest corner which has the best matching normal", 1),
-    ('NEAREST_POLYNOR', "Nearest Corner and Best Matching Face Normal",
-     "Copy from nearest corner which has the face with the best matching normal "
-     "to destination corner's face one", 2),
-    ('NEAREST_POLY', "Nearest Corner of Nearest Face",
-     "Copy from nearest corner of nearest face", 3),
-    ('POLYINTERP_NEAREST', "Nearest Face Interpolated",
-     "Copy from interpolated corners of the nearest source face", 4),
-    ('POLYINTERP_LNORPROJ', "Projected Face Interpolated",
-     "Copy from interpolated corners of the source face hit by corner normal "
-     "projection", 5),
-    ('UV', "UV Interpolated",
-     "Match through UV space: sample where each corner's UV lands in the source "
-     "UV layout (unique to this add-on)", 6),
-]
 
 # 匹配基准 = 拿哪一份数据当"两个网格的共同坐标系"。
 # 形状基准就是普通的表面贴合;UV 基准就是 UV 空间匹配;颜色/权重/属性同理 ——
@@ -107,9 +51,6 @@ _MATCH_BASIS_ITEMS = [
     ('TOPOLOGY', "Index",
      "Straight index copy. Only valid when both meshes have the same vertex and "
      "corner counts — exact and instant", 'MESH_GRID', 7),
-    ('CUSTOM', "Custom",
-     "Pick the raw Blender vertex and corner mapping methods yourself in "
-     "Advanced Mapping", 'PREFERENCES', 8),
 ]
 
 _MATCH_METHOD_ITEMS = [
@@ -124,7 +65,7 @@ _MATCH_METHOD_ITEMS = [
      "(shape basis only)", 2),
 ]
 
-# 形状基准的三种方式 → Blender 原生映射标识符(沿用久经验证的老路径)。
+# 形状基准的三种方式 → 引擎内部的映射标识符(沿用 Blender DataTransfer 的语义与命名)。
 _SHAPE_BASIS_VERTEX_MAPPING = {
     'INTERPOLATED': 'POLYINTERP_NEAREST',
     'NEAREST': 'NEAREST',
@@ -139,12 +80,17 @@ _SHAPE_BASIS_CORNER_MAPPING = {
 # 需要指定层/组/键名的基准。
 NAMED_MATCH_BASES = NAMED_CHANNELS
 
+# 需要投射参数的映射。
+PROJECTED_MAPPINGS = {'POLYINTERP_VNORPROJ', 'POLYINTERP_LNORPROJ'}
+
+# 面板枚举 → 内核用的列号:UV 在哪一分量上镜像,结果位置在哪个轴上翻面。
+UV_MIRROR_COMPONENTS = {'U': 0, 'V': 1}
+RESULT_MIRROR_AXES = {'NONE': None, 'X': 0, 'Y': 1, 'Z': 2}
+
 
 def resolved_vertex_mapping(settings):
     """面板上的基准 → 引擎实际使用的顶点域映射('BASIS' = 走通用基准路径)。"""
     basis = settings.match_basis
-    if basis == 'CUSTOM':
-        return settings.vertex_mapping
     if basis == 'TOPOLOGY':
         return 'TOPOLOGY'
     if basis == POSITION:
@@ -155,8 +101,6 @@ def resolved_vertex_mapping(settings):
 def resolved_corner_mapping(settings):
     """面板上的基准 → 引擎实际使用的角点域映射('BASIS' = 走通用基准路径)。"""
     basis = settings.match_basis
-    if basis == 'CUSTOM':
-        return settings.corner_mapping
     if basis == 'TOPOLOGY':
         return 'TOPOLOGY'
     if basis == POSITION:
@@ -164,32 +108,7 @@ def resolved_corner_mapping(settings):
     return 'BASIS'
 
 
-_ATTRIBUTE_TYPE_ITEMS_WITH_AUTO = [
-    ('AUTO', "Automatic",
-     "Pick the type from how many components the source data has", 0),
-] + [(identifier, label, description, number + 1)
-     for identifier, label, description, number in ATTRIBUTE_TYPE_ITEMS]
-
-
 class MeshSurfaceConformerSettings(PropertyGroup):
-    # ---------- 模式 ----------
-    mode: EnumProperty(
-        name="Mode",
-        description="What this panel does",
-        items=[
-            ('TRANSFER', "Transfer",
-             "Copy whole data types from one mesh onto the others "
-             "(shape, shape keys, vertex groups, UVs, colors, normals)",
-             'MOD_DATA_TRANSFER', 0),
-            ('CONVERT', "Convert",
-             "Turn any single data channel into any other one — UVs into vertex "
-             "positions, positions into UVs, normals into colors, weights into "
-             "colors, and so on",
-             'ARROW_LEFTRIGHT', 1),
-        ],
-        default='TRANSFER',
-    )
-
     # ---------- 源 ----------
     use_evaluated_source: BoolProperty(
         name="Use Modified Source",
@@ -233,20 +152,6 @@ class MeshSurfaceConformerSettings(PropertyGroup):
         ],
         default='WORLD',
     )
-    vertex_mapping: EnumProperty(
-        name="Vertex Mapping",
-        description="How vertex data (shape, shape keys, vertex groups, point colors) "
-                    "finds its counterpart on the source",
-        items=_VERTEX_MAPPING_ITEMS,
-        default='POLYINTERP_NEAREST',
-    )
-    corner_mapping: EnumProperty(
-        name="Corner Mapping",
-        description="How face corner data (UVs, corner colors, custom normals) "
-                    "finds its counterpart on the source",
-        items=_CORNER_MAPPING_ITEMS,
-        default='POLYINTERP_NEAREST',
-    )
     project_bidirectional: BoolProperty(
         name="Bidirectional",
         description="Cast projection rays both along and against the normal and "
@@ -259,16 +164,6 @@ class MeshSurfaceConformerSettings(PropertyGroup):
         default=0.0,
         min=0.0,
         subtype='DISTANCE',
-    )
-    corner_sampling_bias: FloatProperty(
-        name="Corner Bias",
-        description="For interpolated corner mappings: pull the sample point "
-                    "slightly towards the face center so corners on either side "
-                    "of a seam land on the correct source face",
-        default=0.05,
-        min=0.001,
-        max=0.5,
-        precision=3,
     )
     use_max_distance: BoolProperty(
         name="Max Distance",
@@ -355,12 +250,6 @@ class MeshSurfaceConformerSettings(PropertyGroup):
                     "vertex of that key",
         default=False,
     )
-    shape_keys_transfer_drivers: BoolProperty(
-        name="Transfer Drivers",
-        description="Also copy the drivers of the transferred shape keys "
-                    "(uses the armature remap from Rigging Helpers)",
-        default=False,
-    )
 
     # ---------- 数据:顶点组 ----------
     use_vertex_groups: BoolProperty(
@@ -430,104 +319,40 @@ class MeshSurfaceConformerSettings(PropertyGroup):
         default=False,
     )
 
-    # ---------- 转换模式:从 → 到 ----------
-    convert_from: EnumProperty(
-        name="From",
-        description="Which source data to read",
-        items=SOURCE_CHANNEL_ITEMS,
-        default='UV',
+    # ---------- UV 镜像修复 ----------
+    mirror_uv_axis: EnumProperty(
+        name="Mirror UV",
+        description="Which UV axis the two halves of the layout are mirrored across",
+        items=[
+            ('U', "U", "The layout is mirrored left/right in UV space", 0),
+            ('V', "V", "The layout is mirrored up/down in UV space", 1),
+        ],
+        default='U',
     )
-    convert_from_name: StringProperty(
-        name="Name",
-        description="Which layer / group / key / attribute to read "
-                    "(empty = the active one)",
+    mirror_uv_center: FloatProperty(
+        name="Center",
+        description="UV coordinate the two halves are mirrored about "
+                    "(0.5 = the middle of the UV square)",
+        default=0.5,
     )
-    convert_all_named: BoolProperty(
-        name="All, Matched by Name",
-        description="Convert every layer / group / shape key of that kind at once, "
-                    "pairing source and target by name — this is how whole bone "
-                    "weight sets move across in one go",
+    mirror_result_axis: EnumProperty(
+        name="Mirror Positions",
+        description="Object axis the sampled positions are mirrored across, in the "
+                    "local space of the mesh being fixed",
+        items=[
+            ('NONE', "None", "Copy the positions across without mirroring them", 0),
+            ('X', "X", "Mirror across the local YZ plane", 1),
+            ('Y', "Y", "Mirror across the local XZ plane", 2),
+            ('Z', "Z", "Mirror across the local XY plane", 3),
+        ],
+        default='X',
+    )
+    mirror_source_selection_only: BoolProperty(
+        name="Match Selected Source Only",
+        description="Only match against the selected part of the source mesh — in "
+                    "Edit Mode select the good region on the source and the broken "
+                    "region on the mesh being fixed",
         default=False,
-    )
-    convert_to: EnumProperty(
-        name="To",
-        description="Where the converted values are written",
-        items=TARGET_CHANNEL_ITEMS,
-        default='SHAPE_KEY',
-    )
-    convert_to_name: StringProperty(
-        name="Name",
-        description="Target layer / group / key / attribute name "
-                    "(empty = reuse the source name)",
-    )
-    convert_to_domain: EnumProperty(
-        name="Domain",
-        description="Domain of a newly created color attribute or attribute",
-        items=[
-            ('AUTO', "Automatic", "Follow the source data's own domain", 0),
-            ('POINT', "Vertex", "One value per vertex", 1),
-            ('CORNER', "Face Corner", "One value per face corner", 2),
-        ],
-        default='AUTO',
-    )
-    convert_to_attribute_type: EnumProperty(
-        name="Type",
-        description="Data type of a newly created attribute",
-        items=_ATTRIBUTE_TYPE_ITEMS_WITH_AUTO,
-        default='AUTO',
-    )
-
-    # ---------- 转换模式:数值整形 ----------
-    convert_component_mode: EnumProperty(
-        name="Components",
-        description="How the source components are laid out in the target",
-        items=[
-            ('AUTO', "Automatic",
-             "Same count copies straight across; fewer target components take the "
-             "first ones (position to UV = XY); more get padded with 0 and alpha 1 "
-             "(UV to position = XY0); a single target component averages the source", 0),
-            ('CUSTOM', "Custom",
-             "Pick the source of every target component yourself", 1),
-        ],
-        default='AUTO',
-    )
-    convert_component_x: EnumProperty(
-        name="1st", description="Source of the 1st target component",
-        items=COMPONENT_SOURCE_ITEMS, default='X')
-    convert_component_y: EnumProperty(
-        name="2nd", description="Source of the 2nd target component",
-        items=COMPONENT_SOURCE_ITEMS, default='Y')
-    convert_component_z: EnumProperty(
-        name="3rd", description="Source of the 3rd target component",
-        items=COMPONENT_SOURCE_ITEMS, default='Z')
-    convert_component_w: EnumProperty(
-        name="4th", description="Source of the 4th target component",
-        items=COMPONENT_SOURCE_ITEMS, default='ONE')
-    convert_value_remap: EnumProperty(
-        name="Remap",
-        description="Rescale the sampled values before they are laid out",
-        items=VALUE_REMAP_ITEMS,
-        default='NONE',
-    )
-    convert_value_scale: FloatProperty(
-        name="Scale", description="Multiplier applied to the sampled values",
-        default=1.0)
-    convert_value_offset: FloatProperty(
-        name="Offset", description="Added after the multiplier", default=0.0)
-
-    # ---------- 绑定辅助 ----------
-    armature_source: PointerProperty(
-        name="Source Armature",
-        description="Armature referenced by the source drivers",
-        type=bpy.types.Object,
-        poll=poll_armature,
-    )
-    armature_target: PointerProperty(
-        name="Target Armature",
-        description="Armature that should replace the source armature in the "
-                    "copied drivers",
-        type=bpy.types.Object,
-        poll=poll_armature,
     )
 
 

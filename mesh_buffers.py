@@ -133,23 +133,6 @@ _ATTRIBUTE_LAYOUT = {
     'BOOLEAN': ("value", 1, 'BOOL'),
 }
 
-# 可作为转换写入目标的属性类型(供 UI 枚举)。
-ATTRIBUTE_TYPE_ITEMS = [
-    ('FLOAT', "Float", "Single float value", 0),
-    ('FLOAT_VECTOR', "Vector", "3D float vector", 1),
-    ('FLOAT2', "2D Vector", "2D float vector", 2),
-    ('FLOAT_COLOR', "Color", "RGBA float color", 3),
-    ('BYTE_COLOR', "Byte Color", "RGBA 8-bit color", 4),
-    ('INT', "Integer", "Single integer value", 5),
-    ('BOOLEAN', "Boolean", "True/false value", 6),
-]
-
-
-def attribute_component_count(data_type):
-    layout = _ATTRIBUTE_LAYOUT.get(data_type)
-    return layout[1] if layout is not None else 0
-
-
 def read_generic_attribute(mesh, attribute_name):
     """读取任意网格属性。返回 (domain, data_type, (N, C) float64);不支持/不存在返回 None。"""
     attribute = mesh.attributes.get(attribute_name)
@@ -172,46 +155,6 @@ def read_generic_attribute(mesh, attribute_name):
         return None
     values = buffer.astype(np.float64).reshape(count, item_size)
     return attribute.domain, attribute.data_type, values
-
-
-def ensure_generic_attribute(mesh, attribute_name, data_type, domain):
-    """确保属性存在且域/类型一致;不一致时重建。返回 (attribute, recreated);无法建立返回 (None, False)。"""
-    attribute = mesh.attributes.get(attribute_name)
-    recreated = False
-    if attribute is not None and (attribute.domain != domain
-                                  or attribute.data_type != data_type):
-        try:
-            mesh.attributes.remove(attribute)
-        except RuntimeError:
-            return None, False  # 内建属性(position 等)不可重建
-        attribute = None
-        recreated = True
-    if attribute is None:
-        try:
-            attribute = mesh.attributes.new(
-                name=attribute_name, type=data_type, domain=domain)
-        except (RuntimeError, TypeError):
-            return None, recreated
-    return attribute, recreated
-
-
-def write_generic_attribute(attribute, values):
-    """写回任意网格属性,按其数值种类做精确 dtype 转换。"""
-    layout = _ATTRIBUTE_LAYOUT.get(attribute.data_type)
-    if layout is None:
-        return False
-    value_attribute, _item_size, kind = layout
-    if kind == 'FLOAT':
-        buffer = values.astype(np.float32).ravel()
-    elif kind == 'INT':
-        buffer = np.rint(values).astype(np.int32).ravel()
-    else:
-        buffer = (values > 0.5).ravel()
-    try:
-        attribute.data.foreach_set(value_attribute, buffer)
-    except (RuntimeError, TypeError):
-        return False
-    return True
 
 
 def write_vertex_positions(mesh, positions):
@@ -430,17 +373,6 @@ class MeshBufferSnapshot:
         return self._cached("loop_triangles", self._build_loop_triangles)[2]
 
     @property
-    def edge_vertex_indices(self):
-        """(E, 2) 边端点索引。"""
-        return self._cached(
-            "edge_vertex_indices", lambda: _read_ints(self.mesh.edges, "vertices", 2))
-
-    @property
-    def polygon_normals(self):
-        return self._cached(
-            "polygon_normals", lambda: _read_floats(self.mesh.polygon_normals, "vector", 3))
-
-    @property
     def polygon_loop_starts(self):
         return self._cached(
             "polygon_loop_starts", lambda: _read_ints(self.mesh.polygons, "loop_start", 1))
@@ -468,17 +400,6 @@ class MeshBufferSnapshot:
             centers = _read_floats(self.mesh.polygons, "center", 3)
             return centers[self.loop_polygon_indices]
         return self._cached("corner_face_centers", build)
-
-    @property
-    def vertex_loop_csr(self):
-        """顶点 → 其全部 loop 的 CSR 反查表:(按顶点分组排序的 loop 索引, 段偏移 (V+1,))。"""
-        def build():
-            loop_vertex = self.loop_vertex_indices
-            order = np.argsort(loop_vertex, kind='stable')
-            counts = np.bincount(loop_vertex, minlength=self.vertex_count)
-            offsets = np.concatenate(([0], np.cumsum(counts)))
-            return order, offsets
-        return self._cached("vertex_loop_csr", build)
 
     @property
     def corner_normals(self):

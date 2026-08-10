@@ -1,10 +1,9 @@
 # 表面贴合会话:把设置解析成对应关系与影响权重,驱动全部数据类型的传输。
 # 架构:一次会话只构建一次顶点域/角点域对应关系,全部数据类型复用同一内核采样。
-# 映射方式与 Blender DataTransfer 修改器逐项对齐(标识符/命名/语义一致):
-#   顶点域: TOPOLOGY / NEAREST / EDGE_NEAREST / EDGEINTERP_NEAREST /
-#           POLY_NEAREST / POLYINTERP_NEAREST / POLYINTERP_VNORPROJ (+ 本插件独有 UV)
-#   角点域: TOPOLOGY / NEAREST_NORMAL / NEAREST_POLYNOR / NEAREST_POLY /
-#           POLYINTERP_NEAREST / POLYINTERP_LNORPROJ (+ 本插件独有 UV)
+# 匹配基准(Match By)决定"拿哪份数据当两个网格的共同坐标系",与要搬哪份数据完全正交:
+#   形状基准 → 三种方式对应 Blender DataTransfer 的 POLYINTERP_NEAREST / NEAREST /
+#              POLYINTERP_VNORPROJ(角点域为 POLYINTERP_NEAREST / NEAREST_POLY /
+#              POLYINTERP_LNORPROJ);Index 基准 → TOPOLOGY;其余通道 → 通用基准路径。
 # 影响权重统一管线:mix × 顶点组遮罩 × 选择遮罩 × 距离衰减 × 命中有效性,
 # 所有数据按 result = existing + (sampled - existing) × influence 混合落地。
 
@@ -12,19 +11,11 @@ import numpy as np
 
 from .channels import (
     ChannelError,
-    DIRECTIONAL_CHANNELS,
-    NAMED_CHANNELS,
     POSITION,
-    POSITIONAL_CHANNELS,
     UV,
-    TargetChannel,
-    adapt_components,
     channel_label,
-    channel_names,
-    default_target_name,
     lift_to_match_space,
     read_source_channel,
-    remap_values,
     resolve_match_name,
     resolve_source_name,
 )
@@ -32,7 +23,6 @@ from .correspondence import (
     CORNER,
     POINT,
     SurfaceCorrespondence,
-    EdgeNearestQuery,
     GatherCorrespondence,
     DirectVertexCorrespondence,
     CombinedVertexCorrespondence,
@@ -72,18 +62,60 @@ from .mesh_buffers import (
     write_vertex_group_weights,
 )
 from .properties import resolved_corner_mapping, resolved_vertex_mapping
-from .shape_key_drivers import transfer_shape_key_drivers
 
 # 与目标几何无关的映射(可在 Shape 写回后惰性构建)。
-_POSITION_INDEPENDENT_MAPPINGS = {'TOPOLOGY', 'UV'}
+_POSITION_INDEPENDENT_MAPPINGS = {'TOPOLOGY', 'MIRROR'}
+
+# 角点插值采样的导向偏置:角点值朝所属面的均值挪这么一点点来决定命中哪个面,
+# 接缝两侧因此各落到正确的一侧;重心权重仍用真实角点值算,边界不内缩。
+_CORNER_SAMPLING_BIAS = 0.05
 
 
 class ConformError(RuntimeError):
     """配置或数据不满足传输前提时抛出,由算子层转成 report。"""
 
 
+class MirrorPlan:
+    """一次 UV 镜像修复的参数。
+
+    目标的基准值先在某个分量上翻面(UV 完全镜像的模型 = U 绕 0.5 翻),于是每个顶点
+    匹配到的是对面那一半;采样回来的位置再在目标局部的某个轴上翻面,那才是它本该在的地方。
+    """
+
+    __slots__ = ("basis_component", "basis_center", "result_axis",
+                 "source_selection_only", "selection_only")
+
+    def __init__(self, basis_component, basis_center, result_axis,
+                 source_selection_only=False, selection_only=False):
+        self.basis_component = basis_component
+        self.basis_center = basis_center
+        self.result_axis = result_axis
+        self.source_selection_only = source_selection_only
+        self.selection_only = selection_only
+
+
+def mirror_values(values, component, center):
+    """在某一个分量上把一批值翻面。
+
+    用 float32 算:网格里的 UV 本来就是 float32,同精度翻出来的值才可能和源侧逐位相同,
+    精确值匹配那条路(比几何查询准)才吃得到。
+    """
+    mirrored = np.array(values, dtype=np.float64, copy=True)
+    column = mirrored[:, component].astype(np.float32)
+    mirrored[:, component] = np.float32(center * 2.0) - column
+    return mirrored
+
+
+def mirror_matrix(axis):
+    """绕某个轴的零平面翻面的 4×4 矩阵;axis 为 None 时是单位阵。"""
+    matrix = np.identity(4, dtype=np.float64)
+    if axis is not None:
+        matrix[axis, axis] = -1.0
+    return matrix
+
+
 class ConformSession:
-    def __init__(self, context, settings, source_object, target_object):
+    def __init__(self, context, settings, source_object, target_object, mirror=None):
         self._context = context
         self.settings = settings
         self.source_object = source_object
@@ -116,6 +148,11 @@ class ConformSession:
         if self.target_snapshot.vertex_count == 0:
             raise ConformError("Target mesh has no vertices")
 
+        self._mirror = mirror
+        # 编辑模式下的镜像修复只改选中顶点 —— 那是这个用法本身,不是可选项。
+        self.selection_only = settings.use_selection_only or (
+            mirror is not None and mirror.selection_only)
+
         self._source_matrix = matrix_to_numpy(source_object.matrix_world)
         self._target_matrix = matrix_to_numpy(target_object.matrix_world)
         identity = np.identity(4, dtype=np.float64)
@@ -126,11 +163,12 @@ class ConformSession:
                 raise ConformError("Target matrix is not invertible (zero scale?)")
             # 位置数据映射:源局部 → 世界 → 目标局部。
             self._position_matrix = target_inverse @ self._source_matrix
-            # 匹配空间(世界)→ 目标局部,供通道转换里"任意数据当坐标写回"用。
-            self._match_to_target_matrix = target_inverse
         else:
             self._position_matrix = identity
-            self._match_to_target_matrix = identity
+        if mirror is not None:
+            # 翻面挂在最后一步 = 目标局部空间里翻,形状/形态键增量/法线全都跟着对。
+            self._position_matrix = mirror_matrix(
+                mirror.result_axis) @ self._position_matrix
 
         self._source_bridge = None
         self._match_cache = {}
@@ -158,12 +196,16 @@ class ConformSession:
         return self._source_bridge
 
     def vertex_mapping(self):
-        """预设解析后的顶点域映射;就地转换恒为拓扑(逐序号,精确)。"""
+        """基准解析后的顶点域映射;镜像修复自成一路,同物体则逐序号(精确)。"""
+        if self._mirror is not None:
+            return 'MIRROR'
         if self.same_object:
             return 'TOPOLOGY'
         return resolved_vertex_mapping(self.settings)
 
     def corner_mapping(self):
+        if self._mirror is not None:
+            return 'MIRROR'
         if self.same_object:
             return 'TOPOLOGY'
         return resolved_corner_mapping(self.settings)
@@ -222,14 +264,6 @@ class ConformSession:
                 source.triangle_loop_indices)
         return self._cached_match("surface_3d", build)
 
-    def _get_edge_query(self):
-        def build():
-            edges = self.source_snapshot.edge_vertex_indices
-            if edges.shape[0] == 0:
-                raise ConformError("Source mesh has no edges for edge mapping")
-            return EdgeNearestQuery(self._get_source_match_positions(), edges)
-        return self._cached_match("edge_query", build)
-
     def _get_source_vertex_kd(self):
         def build():
             if self.source_snapshot.vertex_count == 0:
@@ -276,11 +310,22 @@ class ConformSession:
             f"element would match the same spot. Pick the layer you actually "
             f"unwrapped / painted")
 
+    def _basis_layer_names(self):
+        """基准两侧的层名(空 = 各自的活动层)。
+
+        镜像修复不吃 Match By 的层名字段:那时面板上的基准可能压根不是 UV,
+        那两个名字属于别的通道,拿来当 UV 层名必然找不到。
+        """
+        if self._mirror is not None:
+            return "", ""
+        return (self.settings.match_basis_name_source,
+                self.settings.match_basis_name_target)
+
     def _get_source_basis_values(self, kind):
         """源侧基准值(匹配空间,已升到 3 分量),供几何建树与精确值匹配共用。"""
         def build():
             return self._read_basis_values(
-                self.source_snapshot, kind, self.settings.match_basis_name_source,
+                self.source_snapshot, kind, self._basis_layer_names()[0],
                 is_target=False)
         return self._cached_match(("source_basis", kind), build)
 
@@ -392,7 +437,11 @@ class ConformSession:
             triangle_loops = source.triangle_loop_indices
             if triangle_vertices.shape[0] == 0:
                 raise ConformError("Source mesh has no faces to match against")
+            selected = self._selected_source_triangles(triangle_vertices)
             if domain == POINT:
+                if selected is not None:
+                    triangle_vertices = triangle_vertices[selected]
+                    triangle_loops = triangle_loops[selected]
                 return (SurfaceCorrespondence(
                     values, triangle_vertices, triangle_vertices, triangle_loops),
                     domain, extent)
@@ -401,7 +450,7 @@ class ConformSession:
                 np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]),
                 axis=1)
             keep = doubled_area > 1e-14
-            if np.any(keep):
+            if np.any(keep if selected is None else (keep & selected)):
                 # 有面撑得开面积 → 零面积的那些是"没展开的面",留着会把查询全吸过去。
                 degenerate_count = int(np.count_nonzero(~keep))
                 if degenerate_count:
@@ -413,15 +462,29 @@ class ConformSession:
                 # 此时插值本就无意义,全留着让重心退化成"取值最接近的那个角",
                 # 这仍是有效匹配 —— 真正致命的"整层塌成一点"已由 extent 闸拦下。
                 keep = np.ones(doubled_area.shape[0], dtype=bool)
+            if selected is not None:
+                keep = keep & selected
             return (SurfaceCorrespondence(
                 values, triangle_loops[keep], triangle_vertices[keep],
                 triangle_loops[keep]), domain, extent)
         return self._cached_match(("basis_surface", kind), build)
 
+    def _selected_source_triangles(self, triangle_vertices):
+        """镜像修复可以只拿源的选中部分建匹配空间(编辑模式下框住好的那半边)。
+        不限制时返回 None,调用方据此整段跳过。"""
+        if self._mirror is None or not self._mirror.source_selection_only:
+            return None
+        selected = self.source_snapshot.vertex_selection[triangle_vertices].all(axis=1)
+        if not np.any(selected):
+            raise ConformError(
+                "Source has no fully selected faces to match against — select the "
+                "good region on the source, or turn Match Selected Source Only off")
+        return selected
+
     def _basis_source_name(self, kind):
         """源侧基准实际用的层名(空 = 活动项)。"""
         return resolve_source_name(
-            self.source_snapshot, kind, self.settings.match_basis_name_source) or ""
+            self.source_snapshot, kind, self._basis_layer_names()[0]) or ""
 
     def _get_target_basis_values(self, kind, domain):
         """目标侧基准值:顶点域基准取逐顶点值,角点域基准取逐角点值。
@@ -431,7 +494,7 @@ class ConformSession:
         """
         def build():
             target_name = resolve_match_name(
-                self.target_snapshot, kind, self.settings.match_basis_name_target,
+                self.target_snapshot, kind, self._basis_layer_names()[1],
                 self._basis_source_name(kind))
             values, target_domain, name, components = self._read_basis_values(
                 self.target_snapshot, kind, target_name, is_target=True)
@@ -443,6 +506,10 @@ class ConformSession:
                     self.target_snapshot.loop_vertex_indices,
                     self.target_snapshot.vertex_count)
                 values = bridge.to_domain(values, target_domain, domain)
+            if self._mirror is not None:
+                # 翻面后每个元素问的就是"对面那一半在这个 UV 上是什么",匹配全程照旧。
+                values = mirror_values(values, self._mirror.basis_component,
+                                       self._mirror.basis_center)
             return values
         return self._cached_match(("target_basis", kind), build)
 
@@ -464,12 +531,28 @@ class ConformSession:
             f"sides of the matching basis probably do not line up (check that both "
             f"point at the same layer)")
 
-    def _warn_if_basis_far(self, kind, distances, valid, extent):
+    def _target_selection_mask(self, domain, first_indices=None):
+        """只改选中顶点时,诊断统计只该看真的会被改的那些元素。不限制返回 None。
+
+        限制了源的匹配范围以后,选区外的元素本来就匹配不到近处,拿它们做证据只会误报。
+        """
+        if not self.selection_only:
+            return None
+        selected = self.target_snapshot.vertex_selection
+        if domain == CORNER:
+            selected = selected[self.target_snapshot.loop_vertex_indices]
+        if first_indices is not None:
+            selected = selected[first_indices]
+        return selected
+
+    def _warn_if_basis_far(self, kind, distances, valid, extent, mask=None):
         """两侧基准明明是"同一份数据"就该几乎零距离命中。
 
         平均命中距离相对基准尺寸偏大 = 十有八九两边指的不是同一层
         (源用 UVMap、目标用了另一套光照 UV),这正是"目标被吸成一小团"的成因。
         """
+        if mask is not None:
+            valid = valid & mask
         if extent <= 1e-12 or not np.any(valid):
             return
         mean_distance = float(np.mean(distances[valid]))
@@ -497,8 +580,7 @@ class ConformSession:
         else:
             corner_values = values
             face_means = self._face_mean_of_corners(corner_values)
-        nudged = corner_values + (
-            face_means - corner_values) * self.settings.corner_sampling_bias
+        nudged = corner_values + (face_means - corner_values) * _CORNER_SAMPLING_BIAS
         return nudged, corner_values
 
     def _face_mean_of_corners(self, corner_values):
@@ -521,21 +603,18 @@ class ConformSession:
             return self._vertex_correspondence
         mapping = self.vertex_mapping()
         target = self.target_snapshot
-        if mapping == 'TOPOLOGY':
-            correspondence = self._build_vertex_topology()
-        elif mapping == 'UV':
-            # Custom 里的传统 UV 映射 = 以 UV 通道为基准的插值匹配。
+        if mapping == 'MIRROR':
+            # 镜像修复恒以 UV 为基准 —— "UV 是镜像的"就是这个功能的全部前提;
+            # 不理会 Match By,也不走同物体的逐序号捷径(那只会对回自己)。
             correspondence = self._build_vertex_basis(UV)
+        elif mapping == 'TOPOLOGY':
+            correspondence = self._build_vertex_topology()
         elif mapping == 'BASIS':
             basis = self.settings.match_basis
             correspondence = self._build_vertex_basis(
                 basis, self._basis_is_nearest(basis))
         elif mapping == 'NEAREST':
             correspondence = self._build_vertex_nearest()
-        elif mapping in {'EDGE_NEAREST', 'EDGEINTERP_NEAREST'}:
-            correspondence = self._build_vertex_edge(mapping)
-        elif mapping == 'POLY_NEAREST':
-            correspondence = self._build_vertex_nearest_face_vertex()
         else:
             # POLYINTERP_NEAREST / POLYINTERP_VNORPROJ:面重心插值(最近点 / 法线投射)。
             correspondence = self._build_vertex_face_interpolated(mapping)
@@ -584,7 +663,8 @@ class ConformSession:
             # 顶点域权重用命中点 + 内钳:采样结果必须落在源面上。
             rows = surface.resolve(
                 triangle_indices, hit_positions, distances, clamp_inside=True)
-            self._warn_if_basis_far(kind, distances, rows.valid, extent)
+            self._warn_if_basis_far(kind, distances, rows.valid, extent,
+                                    self._target_selection_mask(POINT))
             if nearest:
                 rows = rows.as_nearest()
             rows = self._apply_exact_basis_matches(
@@ -600,7 +680,8 @@ class ConformSession:
             values[first_indices], max_distance)
         rows = surface.resolve(
             triangle_indices, hit_positions, distances, clamp_inside=True)
-        self._warn_if_basis_far(kind, distances, rows.valid, extent)
+        self._warn_if_basis_far(kind, distances, rows.valid, extent,
+                                self._target_selection_mask(CORNER, first_indices))
         if nearest:
             rows = rows.as_nearest()
         rows = self._apply_exact_basis_matches(
@@ -621,65 +702,6 @@ class ConformSession:
         return GatherCorrespondence(
             safe_indices[:, None], np.ones((count, 1), dtype=np.float64),
             distances, valid, POINT, self.source_bridge)
-
-    def _build_vertex_edge(self, mapping):
-        """EDGE_NEAREST = 最近边的较近端点;EDGEINTERP_NEAREST = 最近边上最近点线性插值。"""
-        edge_query = self._get_edge_query()
-        points = self._get_target_match_positions()
-        edge_indices, hit_positions, distances = edge_query.query_nearest(
-            points, self._search_max_distance())
-        valid = edge_indices >= 0
-        safe_edges = np.where(valid, edge_indices, 0)
-        endpoints = edge_query.edge_vertex_indices[safe_edges]
-        source_positions = self._get_source_match_positions()
-        position_a = source_positions[endpoints[:, 0]]
-        segment = source_positions[endpoints[:, 1]] - position_a
-        segment_length_squared = np.einsum('ij,ij->i', segment, segment)
-        parameter = np.einsum('ij,ij->i', hit_positions - position_a, segment)
-        parameter = np.divide(
-            parameter, segment_length_squared,
-            out=np.zeros_like(parameter), where=segment_length_squared > 1e-24)
-        np.clip(parameter, 0.0, 1.0, out=parameter)
-        count = points.shape[0]
-        if mapping == 'EDGE_NEAREST':
-            chosen = np.where(parameter > 0.5, endpoints[:, 1], endpoints[:, 0])
-            return GatherCorrespondence(
-                chosen[:, None], np.ones((count, 1), dtype=np.float64), distances, valid,
-                POINT, self.source_bridge)
-        weights = np.stack((1.0 - parameter, parameter), axis=1)
-        return GatherCorrespondence(
-            endpoints, weights, distances, valid, POINT, self.source_bridge)
-
-    def _build_vertex_nearest_face_vertex(self):
-        """POLY_NEAREST = Nearest Face Vertex:最近面上离查询点最近的角顶点。"""
-        surface = self._get_surface_3d()
-        points = self._get_target_match_positions()
-        triangle_indices, _hit_positions, distances = surface.query_nearest(
-            points, self._search_max_distance())
-        valid = triangle_indices >= 0
-        safe_triangles = np.where(valid, triangle_indices, 0)
-        polygons = self.source_snapshot.triangle_polygon_indices[safe_triangles]
-        best_vertices = self._nearest_polygon_vertex(polygons, points)
-        count = points.shape[0]
-        return GatherCorrespondence(
-            best_vertices[:, None], np.ones((count, 1), dtype=np.float64),
-            distances, valid, POINT, self.source_bridge)
-
-    def _nearest_polygon_vertex(self, polygons, query_points):
-        """逐行求多边形角顶点中离查询点最近者(ragged argmin 全向量化)。"""
-        source = self.source_snapshot
-        counts = source.polygon_loop_totals[polygons]
-        row_indices, within_offsets = ragged_arange(counts)
-        candidate_loops = source.polygon_loop_starts[polygons][row_indices] + within_offsets
-        candidate_vertices = source.loop_vertex_indices[candidate_loops]
-        offsets = self._get_source_match_positions()[candidate_vertices] \
-            - query_points[row_indices]
-        scores = np.einsum('ij,ij->i', offsets, offsets)
-        present_segments, best_rows = segment_best_rows(
-            row_indices, scores, take_maximum=False)
-        best_vertices = np.zeros(polygons.shape[0], dtype=np.int64)
-        best_vertices[present_segments] = candidate_vertices[best_rows]
-        return best_vertices
 
     def _build_vertex_face_interpolated(self, mapping):
         surface = self._get_surface_3d()
@@ -705,16 +727,14 @@ class ConformSession:
             return self._corner_correspondence
         mapping = self.corner_mapping()
         target = self.target_snapshot
-        if mapping == 'TOPOLOGY':
-            correspondence = self._build_corner_topology()
-        elif mapping == 'UV':
+        if mapping == 'MIRROR':
             correspondence = self._build_corner_basis(UV)
+        elif mapping == 'TOPOLOGY':
+            correspondence = self._build_corner_topology()
         elif mapping == 'BASIS':
             basis = self.settings.match_basis
             correspondence = self._build_corner_basis(
                 basis, self._basis_is_nearest(basis))
-        elif mapping in {'NEAREST_NORMAL', 'NEAREST_POLYNOR'}:
-            correspondence = self._build_corner_nearest_normal(mapping)
         elif mapping == 'NEAREST_POLY':
             correspondence = self._build_corner_nearest_face_corner()
         else:
@@ -755,7 +775,8 @@ class ConformSession:
                 nudged, max_distance)
             rows = surface.resolve(
                 triangle_indices, exact_values, distances, clamp_inside=False)
-            self._warn_if_basis_far(kind, distances, rows.valid, extent)
+            self._warn_if_basis_far(kind, distances, rows.valid, extent,
+                                    self._target_selection_mask(CORNER))
             rows = self._apply_exact_basis_matches(
                 rows, surface, kind, domain, corner_values)
         else:
@@ -765,59 +786,14 @@ class ConformSession:
                 queries, max_distance)
             rows = surface.resolve(
                 triangle_indices, queries, distances, clamp_inside=False)
-            self._warn_if_basis_far(kind, distances, rows.valid, extent)
+            self._warn_if_basis_far(
+                kind, distances, rows.valid, extent,
+                self._target_selection_mask(CORNER, first_indices))
             rows = self._apply_exact_basis_matches(
                 rows.expand(inverse_indices), surface, kind, domain, values)
         if nearest:
             rows = rows.as_nearest()
         return DirectCornerCorrespondence(rows)
-
-    def _build_corner_nearest_normal(self, mapping):
-        """NEAREST_NORMAL = 最近源顶点上"拆分法线最匹配"的角点;
-        NEAREST_POLYNOR = 最近源顶点上"所属面法线最匹配"的角点。"""
-        source = self.source_snapshot
-        target = self.target_snapshot
-        if source.loop_count == 0:
-            raise ConformError("Source mesh has no face corners")
-        kd_tree = self._get_source_vertex_kd()
-        vertex_points = self._get_target_match_positions()
-        nearest_source_vertex, vertex_distances = query_kd_nearest(kd_tree, vertex_points)
-        vertex_valid = nearest_source_vertex >= 0
-        loop_vertex = target.loop_vertex_indices
-        corner_source_vertex = np.where(vertex_valid, nearest_source_vertex, 0)[loop_vertex]
-
-        sorted_loops, offsets = source.vertex_loop_csr
-        counts = (offsets[1:] - offsets[:-1])[corner_source_vertex]
-        row_indices, within_offsets = ragged_arange(counts)
-        candidate_loops = sorted_loops[
-            offsets[corner_source_vertex][row_indices] + within_offsets]
-
-        if mapping == 'NEAREST_NORMAL':
-            target_normals = self._match_space_target_normals(target.corner_normals)
-            source_normals = self._match_space_source_normals(source.corner_normals)
-            scores = np.einsum(
-                'ij,ij->i', source_normals[candidate_loops], target_normals[row_indices])
-        else:
-            target_normals = self._match_space_target_normals(
-                target.polygon_normals[target.loop_polygon_indices])
-            source_face_normals = self._match_space_source_normals(source.polygon_normals)
-            scores = np.einsum(
-                'ij,ij->i',
-                source_face_normals[source.loop_polygon_indices[candidate_loops]],
-                target_normals[row_indices])
-
-        present_segments, best_rows = segment_best_rows(
-            row_indices, scores, take_maximum=True)
-        loop_count = target.loop_count
-        best_loops = np.zeros(loop_count, dtype=np.int64)
-        found = np.zeros(loop_count, dtype=bool)
-        best_loops[present_segments] = candidate_loops[best_rows]
-        found[present_segments] = True
-        valid = found & vertex_valid[loop_vertex]
-        distances = vertex_distances[loop_vertex]
-        return GatherCorrespondence(
-            best_loops[:, None], np.ones((loop_count, 1), dtype=np.float64),
-            distances, valid, CORNER, self.source_bridge)
 
     def _build_corner_nearest_face_corner(self):
         """NEAREST_POLY = Nearest Corner of Nearest Face:最近面上离角点最近的角。"""
@@ -888,7 +864,7 @@ class ConformSession:
                 self.warnings.append(
                     f"Mask vertex group '{mask_name}' not found on "
                     f"'{self.target_object.name}' — mask ignored")
-        if settings.use_selection_only:
+        if self.selection_only:
             base = base * target.vertex_selection.astype(np.float64)
         self._vertex_influence_base = base
         return base
@@ -1216,153 +1192,36 @@ class ConformSession:
         if transferred_count == 0:
             self.warnings.append("No shape keys were transferred")
             return None
-        summary = f"Shape Keys ({transferred_count})"
-        if settings.shape_keys_transfer_drivers:
-            driver_count = transfer_shape_key_drivers(
-                self.source_object, self.target_object,
-                settings.armature_source, settings.armature_target)
-            summary += f" + {driver_count} driver(s)"
-        return summary
-
-    # ==================== 通道转换(任意通道 → 任意通道) ====================
-
-    def _match_space_source_positions(self, positions):
-        if self._is_world_space():
-            return transform_points(positions, self._source_matrix)
-        return positions
-
-    def _match_space_to_target_positions(self, positions):
-        return transform_points(positions, self._match_to_target_matrix)
-
-    def _match_space_to_target_normals(self, normals):
-        """匹配空间方向 → 目标局部方向(法线的逆转置的逆 = 线性部分的转置)。"""
-        if not self._is_world_space():
-            return normals
-        return normalized_rows(
-            transform_directions(normals, self._target_matrix[:3, :3].T))
-
-    def _warn_on_corner_fold(self, corner_values):
-        """角点域 → 顶点域会取均值:接缝/硬边上的顶点因此被"拉平",必须说清楚。"""
-        bridge = self.source_bridge
-        averaged = bridge.corner_to_vertex(corner_values)
-        deviation = np.abs(
-            corner_values - averaged[bridge.loop_vertex_indices]).max(axis=1)
-        split_loops = deviation > 1e-6
-        if not np.any(split_loops):
-            return
-        split_vertices = int(np.count_nonzero(np.bincount(
-            bridge.loop_vertex_indices, weights=split_loops.astype(np.float64),
-            minlength=bridge.vertex_count) > 0.0))
-        self.warnings.append(
-            f"{split_vertices:,} vertices carry more than one value (UV seams / hard "
-            f"edges) — those were averaged into a single vertex value")
-
-    def _convert_component_picks(self):
-        settings = self.settings
-        if settings.convert_component_mode != 'CUSTOM':
-            return None
-        return [settings.convert_component_x, settings.convert_component_y,
-                settings.convert_component_z, settings.convert_component_w]
-
-    def convert_channel(self):
-        """执行转换。按名字成批时逐条跑同一条管线,对应关系与影响权重只算一次。"""
-        settings = self.settings
-        source_kind = settings.convert_from
-        target_kind = settings.convert_to
-        if settings.convert_all_named and source_kind in NAMED_CHANNELS:
-            names = channel_names(self.source_snapshot, source_kind)
-            if not names:
-                raise ConformError(
-                    f"Source has no {channel_label(source_kind).lower()} to convert")
-            converted = []
-            for name in names:
-                # 成批时目标名恒等于源名 —— 骨骼/顶点组、形态键都按名字一一对上。
-                converted.append(self._convert_one(source_kind, name,
-                                                   target_kind, name))
-            return (f"{channel_label(source_kind)} × {len(converted)} → "
-                    f"{channel_label(target_kind)} (matched by name)")
-        summary = self._convert_one(
-            source_kind, settings.convert_from_name,
-            target_kind, settings.convert_to_name)
-        return summary
-
-    def _convert_one(self, source_kind, source_name, target_kind, target_name):
-        """把源的任意一个通道转成目标的任意一个通道。
-
-        管线:读源 → (位置/方向进匹配空间) → 对应关系采样(可跨域)→ 数值重映射 →
-        分量重映射 → (位置/方向回目标空间)→ 按影响权重与现值混合 → 写回。
-        """
-        settings = self.settings
-        try:
-            source_data = read_source_channel(
-                self.source_snapshot, source_kind, source_name)
-        except ChannelError as error:
-            raise ConformError(str(error))
-
-        values = source_data.values
-        if source_data.positional:
-            values = self._match_space_source_positions(values)
-        elif source_data.directional:
-            values = self._match_space_source_normals(values)
-
-        resolved_target_name = target_name or default_target_name(
-            source_data.name, target_kind)
-        try:
-            target = TargetChannel(
-                self.target_object, target_kind, resolved_target_name,
-                source_data.domain, source_data.components,
-                settings.convert_to_domain, settings.convert_to_attribute_type)
-        except ChannelError as error:
-            raise ConformError(str(error))
-
-        if target.domain == POINT:
-            correspondence = self.get_vertex_correspondence()
-            influence = self._vertex_influence(correspondence)[:, None]
-            if source_data.domain == CORNER:
-                self._warn_on_corner_fold(values)
-        else:
-            correspondence = self.get_corner_correspondence()
-            influence = self._corner_influence(correspondence)[:, None]
-
-        sampled = correspondence.sample(values, source_data.domain)
-        sampled = remap_values(
-            sampled, settings.convert_value_remap,
-            settings.convert_value_scale, settings.convert_value_offset)
-        result = adapt_components(
-            sampled, target.components, self._convert_component_picks())
-
-        if target_kind in POSITIONAL_CHANNELS:
-            # 数值一律按"所选空间"解释:世界模式下 UV / 颜色等非位置数据也被当成
-            # 世界坐标写回,所以 UV → 形态键就是把 UV 布局摊在世界的 1×1 方格里。
-            result = self._match_space_to_target_positions(result)
-            if source_data.positional:
-                # 位置转位置才谈得上"塌缩";UV→顶点这类本来就该变形状,不适用。
-                valid = correspondence.valid
-                self._warn_if_collapsed(
-                    self.target_snapshot.vertex_positions[valid], result[valid])
-        elif target_kind in DIRECTIONAL_CHANNELS:
-            result = self._match_space_to_target_normals(result)
-
-        existing = target.read_existing(self.target_snapshot)
-        blended = existing + (result - existing) * influence
-        try:
-            target.write(blended)
-        except ChannelError as error:
-            raise ConformError(str(error))
-        target.focus()
-
-        if target.recreated:
-            self.warnings.append(
-                f"'{target.name}' was recreated to fit the converted data")
-        return (f"{channel_label(source_kind)} '{source_data.name}' → "
-                f"{channel_label(target_kind)} '{target.name}'")
+        return f"Shape Keys ({transferred_count})"
 
     # ==================== 执行入口 ====================
 
+    def mirror_shape(self):
+        """UV 镜像修复:拿翻过面的 UV 找到对面的顶点,采到的位置翻回来直接写进坐标。
+
+        走的是和 Shape 传输同一条采样管线,只是基准值先翻了面、结果不落形态键 ——
+        "修坐标"要的就是网格本体被改对。
+        """
+        if self.same_object and np.all(self._get_vertex_influence_base() > 0.0):
+            # 每个顶点都要改 + 源就是自己 = 两半原地对调,坏的那半反而会覆盖好的那半。
+            # 判据取真实影响权重,遮罩组名写错(退化成全量)也照样拦得住。
+            raise ConformError(
+                "Mirroring a whole mesh onto itself just swaps its two halves — go "
+                "into Edit Mode and select the vertices to fix, or set a vertex "
+                "group mask, or pick a second mesh to copy from")
+        correspondence = self.get_vertex_correspondence()
+        influence = self._vertex_influence(correspondence)[:, None]
+        sampled = correspondence.sample(self.source_snapshot.vertex_positions, POINT)
+        mapped = transform_points(sampled, self._position_matrix)
+        original = self.target_snapshot.vertex_positions
+        result = original + (mapped - original) * influence
+        apply_vertex_positions(self.target_object, result)
+        changed = int(np.count_nonzero(influence[:, 0] > 0.0))
+        return f"{changed:,} vertices"
+
     def run(self):
-        if self.settings.mode == 'CONVERT':
-            summary = self.convert_channel()
-            self.summaries.append(summary)
+        if self._mirror is not None:
+            self.summaries.append(self.mirror_shape())
             return self.summaries, self.warnings
 
         settings = self.settings

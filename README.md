@@ -2,26 +2,20 @@
 
 作者:ShiyumeMeguri · Blender 4.2+ / 5.x
 
-通用表面贴合与数据互转插件(自 mesh-data-transfer-2 全量重构)。
+**以任意数据为基准,把任意数据搬到另一个网格上。**
 面板位置:`3D 视图 > 侧边栏 (N) > Mesh Surface Conformer`(独立标签页),
 菜单入口:`Object > Link/Transfer Data > Conform Surface Data`(Ctrl+L)。
 
-## 两个模式,一个按钮
+插件只有两件事,而且互相正交:
 
-面板顶部只有两个标签页,选谁决定按钮做什么:
+| | 干什么 |
+| --- | --- |
+| **Match By(匹配基准)** | 用哪份数据当"两个网格的共同坐标系"去找对应关系 |
+| **六个数据开关** | 要搬哪几类数据:形状 / 形态键 / 顶点组 / UV / 颜色 / 法线 |
 
-| 模式 | 干什么 | 怎么选物体 |
-| --- | --- | --- |
-| **Transfer** | 整类数据搬运:形状 / 形态键 / 顶点组 / UV / 颜色 / 法线 | 先选源,最后选**要改的那个**(活动物体) |
-| **Convert** | **任意通道 → 任意通道**,跨类型互转 | 只选一个 = 就地转换;选两个 = 从源转到活动物体 |
+外加一个独立的 **UV Mirror** 子面板:UV 完全镜像的模型,不用镜像修改器也能把选中顶点的坐标修回来。
 
-两个模式都受同一个 **Match By(匹配基准)** 支配 —— 用哪份数据当基准去找对应关系,
-与要搬哪份数据完全正交。这是整个插件的骨架:**以任意数据为基准,转换任意数据**。
-
-其余全部折进四个默认折叠的子面板(Data / Convert Options、Influence、
-Advanced Mapping、Rigging Helpers),平时看不见。
-
-### Transfer:三步
+## 三步
 
 1. **先选源,最后选要改的那个**(活动物体 = 被写入的目标)。与 Ctrl+L /
    `object.data_transfer` 相反 —— 那套把活动物体当源,读起来是反的。
@@ -42,54 +36,6 @@ Advanced Mapping、Rigging Helpers),平时看不见。
 > **transform 无关**:`Space` 选 `Local` 时结果完全不受两边物体变换影响
 > (源旋转 90° 前后结果逐位相同);`World` 则按设计取源在世界里的实际位置。
 
-### Convert:两行
-
-**From** 一行、**To** 一行,中间一个 ⟳ 交换按钮,下面实时显示分量怎么排:
-
-```
-From: UV Map    [UVMap]
-              ⟳
-To:   Shape Key [UVMap]
-2 → 3 components:   X Y 0
-```
-
-七种通道,任意一对都能转(共 49 种组合,全部有自测覆盖):
-
-| 通道 | 域 | 分量 |
-| --- | --- | --- |
-| Vertex Position | 顶点 | 3 |
-| Shape Key | 顶点 | 3 |
-| UV Map | 角点 | 2 |
-| Normal | 角点 | 3 |
-| Color Attribute | 顶点/角点 | 4 |
-| Vertex Group | 顶点 | 1 |
-| Attribute(任意点/角点属性) | 顶点/角点 | 1~4 |
-
-**顶点类结果默认落到形态键**(To 的默认项就是 Shape Key),网格本体不动。
-
-常用组合:
-
-- `UV → Shape Key` = 物理展开:顶点摊平到 UV 布局(即"利用 UV 转空间顶点");
-- `Vertex Position → UV` = 把世界/局部坐标烘进 UV 层(即"利用空间转换 UV 顶点");
-- `Normal → Color Attribute` + Remap `-1..1 to 0..1` = 法线烘成顶点色;
-- `Vertex Group → Color Attribute` = 权重可视化(灰阶,Alpha 补 1);
-- `Color Attribute → Vertex Group` = 顶点色转权重(取 RGB 平均,忽略 Alpha);
-- `Vertex Position → Attribute` = 存一份坐标备份,之后再 `Attribute → Shape Key` 还原。
-
-跨域自动折算:角点 → 顶点取同顶点各角点均值(接缝顶点会提示被平均了多少个),
-顶点 → 角点直接展开,无损。
-
-分量不匹配也自动处理(Convert Options 里可以改成逐分量手动指定 X/Y/Z/W/长度/平均/0/1):
-
-- 分量数相同 → 原样;
-- 目标只要 1 个 → 取前三个分量平均(忽略 Alpha);
-- 源只有 1 个 → 广播(Alpha 补 1);
-- 目标更少 → 取前若干个(位置→UV = XY);
-- 目标更多 → 补 0,4 分量目标末位补 1(UV→位置 = XY0)。
-
-数值重映射:None / Normalize 0..1 / -1..1↔0..1 / Scale + Offset,
-在分量重排**之前**作用,所以补出来的常量 Alpha 不会被一起缩放。
-
 ## 匹配基准(Match By)—— 拿哪份数据当"两个网格的共同坐标系"
 
 这是本插件的核心:**任何一个通道都能当基准**。两边读同一个通道,值相同的地方就是同一个
@@ -105,10 +51,9 @@ To:   Shape Key [UVMap]
 | **Shape Key** | 某个形态键的形状 | 按静止态匹配而不是按当前形状 |
 | **Normal** | 法线方向 | 按朝向匹配 |
 | **Index** | 顶点/角点序号 | 同拓扑,精确且瞬时 |
-| **Custom** | 手选 Blender 原生映射 | 见下 |
 
 反过来同理:**两个 mesh 形状完全一致、UV 完全不一致** → Match By 选 `Shape`、传输 `UVs`,
-UV 就被拉回完全一致。这两个方向都有逐值比对的自测(误差 < 1e-4)。
+UV 就被拉回完全一致。这两个方向都有逐值比对的自测。
 
 **Method** 决定在基准空间里怎么取值:
 
@@ -116,16 +61,8 @@ UV 就被拉回完全一致。这两个方向都有逐值比对的自测(误差 
 - `Nearest` —— 只取最近的那一个源元素,数值一个不改地搬过来(离散数据/ID 用这个);
 - `Projected` —— 沿目标法线投射(仅 Shape 基准有意义,其余会自动退回插值并提示)。
 
-`Custom` 下可用的全集与 Blender DataTransfer 修改器逐字对齐 ——
-顶点域:Topology · Nearest Vertex · Nearest Edge Vertex · Nearest Edge Interpolated ·
-Nearest Face Vertex · Nearest Face Interpolated · Projected Face Interpolated · **UV Interpolated**;
-角点域:Topology · Nearest Corner and Best Matching Normal ·
-Nearest Corner and Best Matching Face Normal · Nearest Corner of Nearest Face ·
-Nearest Face Interpolated · Projected Face Interpolated · **UV Interpolated**。
-
 基准是角点域(UV/法线/角点色)时,同一顶点的多份值(接缝)按逆距离权重收敛到唯一结果;
 基准是顶点域(形状/权重/点色)时,角点查询带"导向偏置",接缝两侧各归各的面。
-就地转换(只选一个物体)恒为逐序号对应,精确且不做任何空间查询。
 
 ### 基准对不上时不会闷声出错
 
@@ -139,42 +76,60 @@ Nearest Face Interpolated · Projected Face Interpolated · **UV Interpolated**�
 目标层名的解析顺序是 **显式指定 > 与源同名 > 目标的活动层**,所以只要两边层名一致,
 哪边的活动层是什么都不影响结果。
 
-## 骨骼:按名字成批转换
-
-Convert 模式勾上 **All, Matched by Name**,源上该类型的每一层/组/键都会转到目标上
-**同名**的那一份 —— 整套骨骼权重一次搬完,不用一根根点:
-
-- `Vertex Group → Vertex Group` + All = 全套骨骼权重按骨名配对转移(几何用上面任意基准匹配);
-- `Vertex Group → Attribute` + All = 每根骨的权重变成同名属性;
-- 形态键、UV 层、颜色属性同样支持成批按名配对。
-
-Transfer 模式的 Vertex Groups / Shape Keys 本来就是按名字配对的整类搬运,
-两条路都不依赖顶点组的序号。
-
 空间:World / Local;统一影响管线:Mix × 顶点组遮罩 × 编辑选择 × 最大距离(带衰减)。
 
-> 为什么不是修改器:Python 插件无法注册原生修改器;Geometry Nodes 写不了形态键/
-> 自定义法线/批量顶点组,做成 GN 修改器只能交残血版,故按一次性算子交付(带撤销)。
+## UV Mirror —— 模型不能用镜像修改器,但 UV 是镜像的
 
-## 对旧版缺陷的修复
+模型因为某些约束不能挂镜像修改器,而它的 UV 是完完全全镜像的(左半边的 `u`
+与右半边的 `1-u` 一一对应)。那么**选中的顶点就能用 UV 镜像所对应的那个顶点把坐标修回来**:
+面板 `UV Mirror` 子面板 → **Fix by UV Mirror**,编辑模式下也在 `Vertex` 菜单(Ctrl+V)里。
+
+| 选中情况 | 行为 |
+| --- | --- |
+| **只选一个物体** | 拿自己 UV 的另一半修自己,默认 **X 轴镜像** |
+| **选两个物体** | 从源那个网格按 UV 镜像复制到活动物体上 |
+| **编辑模式** | 只修**选中的顶点**,没选的一个都不动 |
+| **物体模式** | 整个网格都修(所以"自己镜像自己"会被拒绝 —— 那只是把两半对调) |
+
+三个参数:
+
+- **Mirror UV**:UV 沿 `U` 还是 `V` 镜像(默认 U);
+- **Center**:两半关于哪个 UV 坐标对称(默认 0.5,即 UV 方格正中);
+- **Mirror Positions**:采回来的坐标在目标局部空间的哪个轴上翻面(默认 X,可关)。
+
+**Match Selected Source Only**:编辑模式下同时选两个物体时,可以只拿源上**选中的那部分**
+参与匹配 —— 源上框好的那半边 + 目标上框坏的那半边,互不干扰。注意面要整张选中才算数。
+
+一路走的都是上面那套匹配内核(基准恒为两边各自的活动 UV 层,不吃 Match By 的层名字段),
+所以接缝/合并顶点的收敛、UV 岛不渗色、影响权重(Mix × 顶点组遮罩)全都照旧生效。
+UV 翻面用 float32 算,和网格里存的 UV 同精度,能逐位对上的地方直接走精确值匹配,
+对不上的退回 UV 空间几何查询 —— 实测两种 UV 布局下修复结果都与真值逐位相同。
+
+> 两个物体时结果落在哪由 `Space` 决定:`World`(默认)= 落到源在世界里的实际位置;
+> 只修一部分顶点、两个物体又不重合时,通常要把 `Space` 切到 `Local`。
+
+## 为什么不是修改器
+
+Python 插件无法注册原生修改器;Geometry Nodes 写不了形态键/自定义法线/批量顶点组,
+做成 GN 修改器只能交残血版,故按一次性算子交付(带撤销)。
+
+## 实现要点
 
 1. **插值最近表面匹配**:任意拓扑差异(低模↔低模/高模)都取源面上的精确最近点做重心插值,
-   不再强制最近顶点吸附(Nearest 系映射与 Snap 选项按 Blender 语义显式提供)。
+   不强制最近顶点吸附(Nearest 与 Snap 按 Blender 语义显式提供)。
 2. **UV 匹配的合并顶点一致性**:同一网格顶点的多个 UV loop(接缝/合并顶点)逐 loop 采样后
-   按逆距离权重收敛,顶点必然落到唯一位置,修复旧版"最后写入者赢"的错乱。
+   按逆距离权重收敛,顶点必然落到唯一位置。
 3. **角点域接缝正确性**:UV/颜色/法线按"导向偏置"逐面角采样,接缝两侧各自命中正确源面,
    边界权重线性外推不内缩。
-4. 纯数据级实现:去掉 DataTransfer 修改器、`seams_from_islands` 改源网格、模式切换链;
+4. **纯数据级实现**:不用 DataTransfer 修改器、不改源网格 seam、不切模式;
    求值源(Use Modified Source)时全部数组取自同一份求值网格,消除索引错位。
-5. 现代 API:numpy 2.x 兼容(旧版 `np.float` 已崩)、`uv_layers[].uv`、`corner_normals`、
-   `color_attributes`。
+5. **现代 API**:numpy 2.x、`uv_layers[].uv`、`corner_normals`、`color_attributes`。
 
 ## 性能
 
 - 一次会话只构建一次顶点域/角点域对应关系,全部数据复用同一采样内核;
 - 每种对应关系都实现统一的 `sample(data, domain)`,跨域折算只是一次 `bincount` /
-  一次 gather,所以"任意通道 → 任意通道"没有额外查询成本;
+  一次 gather,所以任何数据类型都没有额外查询成本;
 - 全部读写走 `foreach_get/foreach_set` 精确 dtype 快路径,数学计算 float64 向量化;
-- Nearest 系竞选(最近面顶点/最匹配法线角点)用 ragged 展开 + lexsort 分段取优,全程无 Python 逐候选循环;
-- 边映射以退化三角形 (a, b, b) 建 BVH,`find_nearest` 天然退化为线段最近点;
+- 最近面角点竞选用 ragged 展开 + lexsort 分段取优,全程无 Python 逐候选循环;
 - UV 查询按 2^24 量化去重(典型省 4~6 倍);顶点组写回按 16 位量化批量 `add`。

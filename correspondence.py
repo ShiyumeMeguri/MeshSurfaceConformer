@@ -328,38 +328,6 @@ class SurfaceCorrespondence:
         return CorrespondenceRows(valid, safe_indices, weights, distances, self)
 
 
-class EdgeNearestQuery:
-    """边最近点查询:以退化三角形 (a, b, b) 建 BVH,find_nearest 的命中即线段最近点
-    (closest_on_tri 对退化三角形自然退化为线段最近点)。"""
-
-    __slots__ = ("edge_vertex_indices", "_bvh_tree")
-
-    def __init__(self, vertex_positions, edge_vertex_indices):
-        self.edge_vertex_indices = edge_vertex_indices  # (E, 2) int64
-        triangles = np.column_stack((
-            edge_vertex_indices[:, 0],
-            edge_vertex_indices[:, 1],
-            edge_vertex_indices[:, 1]))
-        self._bvh_tree = BVHTree.FromPolygons(
-            vertex_positions.tolist(), triangles.tolist(), all_triangles=True)
-
-    def query_nearest(self, query_points, max_distance=None):
-        """返回 (edge_indices, hit_positions, distances),未命中行 index=-1。"""
-        count = query_points.shape[0]
-        edge_indices = np.full(count, -1, dtype=np.int64)
-        hit_positions = np.zeros((count, 3), dtype=np.float64)
-        distances = np.full(count, np.inf, dtype=np.float64)
-        search_radius = float(max_distance) if max_distance is not None else _UNLIMITED_DISTANCE
-        find_nearest = self._bvh_tree.find_nearest
-        for index, point in enumerate(query_points.tolist()):
-            location, _normal, edge_index, distance = find_nearest(point, search_radius)
-            if edge_index is not None:
-                edge_indices[index] = edge_index
-                hit_positions[index] = location
-                distances[index] = distance
-        return edge_indices, hit_positions, distances
-
-
 def build_kd_tree(positions):
     """mathutils KDTree 构建(最近顶点系映射用)。"""
     kd_tree = KDTree(positions.shape[0])
