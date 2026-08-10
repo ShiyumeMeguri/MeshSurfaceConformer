@@ -239,6 +239,17 @@ class MeshSurfaceConformerSettings(PropertyGroup):
                     "target basis",
         default=False,
     )
+    shape_keys_transfer_all: BoolProperty(
+        name="All Keys",
+        description="Transfer every source shape key instead of a single one. Turn "
+                    "this off when one key is being used as the matching anchor — "
+                    "transferring all of them overwrites that key on the target too",
+        default=True,
+    )
+    shape_keys_transfer_key: StringProperty(
+        name="Key",
+        description="Source shape key to transfer (empty = the active one)",
+    )
     shape_keys_exclude_muted: BoolProperty(
         name="Exclude Muted",
         description="Skip muted shape keys",

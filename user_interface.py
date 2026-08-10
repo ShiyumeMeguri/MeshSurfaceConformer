@@ -259,6 +259,15 @@ class VIEW3D_PT_mesh_surface_conformer_data(ConformerPanelMixin, Panel):
             drawn = True
             layout.separator()
             column = layout.column(heading="Shape Keys")
+            column.prop(settings, "shape_keys_transfer_all")
+            key_column = column.column()
+            key_column.active = not settings.shape_keys_transfer_all
+            source_keys = source.data.shape_keys if source is not None else None
+            if source_keys is not None:
+                key_column.prop_search(
+                    settings, "shape_keys_transfer_key", source_keys, "key_blocks")
+            else:
+                key_column.prop(settings, "shape_keys_transfer_key")
             column.prop(settings, "shape_keys_exclude_muted")
             column.prop(settings, "snap_shape_keys_to_vertices")
 

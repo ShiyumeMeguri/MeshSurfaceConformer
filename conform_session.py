@@ -1141,6 +1141,23 @@ class ConformSession:
         finally:
             evaluated_object.to_mesh_clear()
 
+    def _shape_keys_to_transfer(self, key_blocks):
+        """要搬源上的哪几个形态键(Basis 是静止态,永远不算一条形变数据)。
+
+        点名单个键时,目标上其余的同名键分毫不动 —— 拿某个键当匹配锚点时,
+        整套搬会把目标上那个锚点键本身也一并覆盖掉。
+        """
+        candidates = list(key_blocks)[1:]
+        if self.settings.shape_keys_transfer_all:
+            return candidates
+        wanted = (self.settings.shape_keys_transfer_key
+                  or self.source_snapshot.active_shape_key_name)
+        chosen = [key_block for key_block in candidates if key_block.name == wanted]
+        if not chosen:
+            self.warnings.append(
+                f"Source shape key '{wanted}' not found — nothing to transfer")
+        return chosen
+
     def transfer_shape_keys(self):
         settings = self.settings
         source_shape_keys = self.source_object.data.shape_keys
@@ -1180,7 +1197,7 @@ class ConformSession:
                 base_positions = read_shape_key_positions(
                     key_blocks[0], source_vertex_count)
             base_sampled = correspondence.sample(base_positions, POINT)
-            for key_block in list(key_blocks)[1:]:
+            for key_block in self._shape_keys_to_transfer(key_blocks):
                 if settings.shape_keys_exclude_muted and key_block.mute:
                     continue
                 if use_evaluated:
