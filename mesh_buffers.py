@@ -208,14 +208,20 @@ def ensure_shape_key(target_object, shape_key_name):
     return key_block, True
 
 
+def is_editable(datablock):
+    """这个数据块能不能改。链接进来的库数据不能 —— Python API 不拦,改了就是在改别人的文件。"""
+    return getattr(datablock, "is_editable", datablock.library is None)
+
+
 def read_shape_key_mix_positions(mesh_object):
-    """当前形态键混合后的顶点坐标(不经修改器,顶点数不变);没有形态键返回 None。
+    """当前形态键混合后的顶点坐标(不经修改器,顶点数不变)。
 
     借 Blender 自己的 from_mix 求值,不重实现相对形态键/相对键/顶点组遮罩那一套。
-    会短暂增删一个形态键,所以必须在持有任何求值网格之前调用。
+    会短暂增删一个形态键,所以必须在持有任何求值网格之前调用,也因此只能在可编辑数据上做。
+    没有形态键、或数据是链接进来的库数据,一律返回 None(调用方据此退回静止态)。
     """
     mesh = mesh_object.data
-    if mesh.shape_keys is None:
+    if mesh.shape_keys is None or not is_editable(mesh):
         return None
     temporary = mesh_object.shape_key_add(name="__conformer_mix__", from_mix=True)
     try:

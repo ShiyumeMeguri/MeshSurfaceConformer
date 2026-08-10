@@ -123,6 +123,8 @@ class ConformSession:
         self.settings = settings
         self.source_object = source_object
         self.target_object = target_object
+        self.warnings = []
+        self.summaries = []
 
         if source_object is None or source_object.type != 'MESH':
             raise ConformError("Source must be a mesh object")
@@ -145,13 +147,13 @@ class ConformSession:
             target_current = read_shape_key_positions(
                 self.target_key_block, len(target_object.data.vertices))
         else:
-            target_current = read_shape_key_mix_positions(target_object)
+            target_current = self._current_shape_positions(target_object)
         if settings.use_evaluated_source:
             source_current = None
         elif self.same_object:
             source_current = target_current
         else:
-            source_current = read_shape_key_mix_positions(source_object)
+            source_current = self._current_shape_positions(source_object)
         depsgraph = context.evaluated_depsgraph_get() if settings.use_evaluated_source else None
         self.source_snapshot = MeshBufferSnapshot(
             source_object, settings.use_evaluated_source, depsgraph)
@@ -193,8 +195,23 @@ class ConformSession:
         self._vertex_influence_base = None
         self._influence_cache = {}
         self._exact_match_counts = {}
-        self.warnings = []
-        self.summaries = []
+
+    def _current_shape_positions(self, mesh_object):
+        """物体当前可见形状(形态键混合后)。
+
+        求这个形状要借 Blender 的 from_mix 临时加一个形态键,而链接进来的库数据不许改,
+        所以那种情况退回静止态并说清楚 —— 绝不为了读一份坐标去动别人的文件。
+        """
+        mesh = mesh_object.data
+        if mesh.shape_keys is None:
+            return None
+        positions = read_shape_key_mix_positions(mesh_object)
+        if positions is None:
+            self.warnings.append(
+                f"'{mesh_object.name}' is linked library data — read at its rest "
+                f"shape instead of the shape key mix (turn Use Modified Source on "
+                f"to sample the shape you actually see)")
+        return positions
 
     def free(self):
         self.source_snapshot.free()

@@ -10,6 +10,7 @@ from bpy.props import EnumProperty
 from bpy.types import Operator
 
 from .conform_session import ConformSession, ConformError, MirrorPlan
+from .mesh_buffers import is_editable
 from .properties import RESULT_MIRROR_AXES, UV_MIRROR_COMPONENTS
 
 # 快捷预设 → 六个数据开关的取值(顺序:形状/形态键/顶点组/UV/颜色/法线)。
@@ -58,6 +59,10 @@ def poll_selection(cls, context, allow_self):
     active = context.active_object
     if active is None or active.type != 'MESH':
         cls.poll_message_set("Make the mesh you want to modify the active object")
+        return False
+    if not (is_editable(active) and is_editable(active.data)):
+        cls.poll_message_set(
+            f"'{active.name}' is linked library data — it cannot be modified")
         return False
     if len(other_selected_meshes(context, active)) > 1:
         cls.poll_message_set("Select exactly one source plus the mesh to modify")
