@@ -162,22 +162,37 @@ def write_vertex_positions(mesh, positions):
     mesh.update()
 
 
-def apply_vertex_positions(target_object, positions):
+def apply_vertex_positions(target_object, positions, reference_positions):
     """把顶点移动到新坐标,并保住形态键。
 
-    目标带形态键时:Basis 与全部键整体平移同样的位移,各键的相对形变原样保留
-    (只写网格顶点在有键时视口不生效,是旧版的隐性缺陷)。
+    目标带形态键时:Basis 与全部键整体平移同样的位移,各键的相对形变原样保留,
+    网格顶点跟着 Basis 走。reference 必须是 positions 所基于的那份坐标(= 目标当前
+    可见形状);拿 Basis 当参考会把形态键混合出来的形变重复叠一遍到每一个键上。
     """
     mesh = target_object.data
-    if mesh.shape_keys is not None:
-        key_blocks = mesh.shape_keys.key_blocks
-        vertex_count = len(mesh.vertices)
-        basis_positions = read_shape_key_positions(key_blocks[0], vertex_count)
-        shift = positions - basis_positions
-        for key_block in key_blocks:
-            key_positions = read_shape_key_positions(key_block, vertex_count)
-            write_shape_key_positions(key_block, key_positions + shift)
-    write_vertex_positions(mesh, positions)
+    if mesh.shape_keys is None:
+        write_vertex_positions(mesh, positions)
+        return
+    key_blocks = mesh.shape_keys.key_blocks
+    vertex_count = len(mesh.vertices)
+    shift = positions - reference_positions
+    for key_block in key_blocks:
+        key_positions = read_shape_key_positions(key_block, vertex_count)
+        write_shape_key_positions(key_block, key_positions + shift)
+    write_vertex_positions(
+        mesh, read_shape_key_positions(key_blocks[0], vertex_count))
+
+
+def active_shape_key_block(mesh_object):
+    """用户此刻正在编辑的那个形态键;没有形态键或索引越界返回 None。"""
+    shape_keys = mesh_object.data.shape_keys
+    if shape_keys is None:
+        return None
+    key_blocks = shape_keys.key_blocks
+    index = mesh_object.active_shape_key_index
+    if 0 <= index < len(key_blocks):
+        return key_blocks[index]
+    return None
 
 
 def ensure_shape_key(target_object, shape_key_name):

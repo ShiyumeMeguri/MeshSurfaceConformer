@@ -80,7 +80,8 @@ def run_session(operator, context, settings, source, target, verb, mirror=None):
 
     session = None
     try:
-        session = ConformSession(context, settings, source, target, mirror)
+        session = ConformSession(context, settings, source, target, mirror,
+                                 in_edit_mode=original_mode == 'EDIT')
         summaries, warnings = session.run()
     except ConformError as error:
         if session is not None:

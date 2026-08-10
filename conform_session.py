@@ -41,9 +41,11 @@ from .correspondence import (
 )
 from .mesh_buffers import (
     MeshBufferSnapshot,
+    active_shape_key_block,
     add_numbered_shape_key,
     add_numbered_uv_layer,
     apply_vertex_positions,
+    write_vertex_positions,
     read_shape_key_mix_positions,
     matrix_to_numpy,
     transform_points,
@@ -115,7 +117,8 @@ def mirror_matrix(axis):
 
 
 class ConformSession:
-    def __init__(self, context, settings, source_object, target_object, mirror=None):
+    def __init__(self, context, settings, source_object, target_object, mirror=None,
+                 in_edit_mode=False):
         self._context = context
         self.settings = settings
         self.source_object = source_object
@@ -129,21 +132,34 @@ class ConformSession:
         # 精确且不需要任何空间查询,所以强制走拓扑映射。
         self.same_object = source_object == target_object
 
+        # 编辑模式下用户看到、也正在改的是活动形态键本身(不是形态键混合结果),
+        # 所以读它、写也写回它 —— 动的就是你正在编辑的那份坐标。
+        self.target_key_block = (
+            active_shape_key_block(target_object) if in_edit_mode else None)
+
         # 两边都按"当前可见形状"(形态键混合后)参与匹配:源上调了形态键就该按调完的
         # 形状搬运,目标则接着上一次的结果继续推进,而不是每次都从静止态重来。
         # 求值源自带形态键与修改器,不用也不能再叠这一层(顶点数已经变了)。
         # 混合取值会短暂增删一个形态键,必须赶在源求值网格建立之前做完。
-        source_mix = (None if settings.use_evaluated_source
-                      else read_shape_key_mix_positions(source_object))
-        target_mix = read_shape_key_mix_positions(target_object)
+        if self.target_key_block is not None:
+            target_current = read_shape_key_positions(
+                self.target_key_block, len(target_object.data.vertices))
+        else:
+            target_current = read_shape_key_mix_positions(target_object)
+        if settings.use_evaluated_source:
+            source_current = None
+        elif self.same_object:
+            source_current = target_current
+        else:
+            source_current = read_shape_key_mix_positions(source_object)
         depsgraph = context.evaluated_depsgraph_get() if settings.use_evaluated_source else None
         self.source_snapshot = MeshBufferSnapshot(
             source_object, settings.use_evaluated_source, depsgraph)
         self.target_snapshot = MeshBufferSnapshot(target_object)
-        if source_mix is not None:
-            self.source_snapshot.seed_vertex_positions(source_mix)
-        if target_mix is not None:
-            self.target_snapshot.seed_vertex_positions(target_mix)
+        if source_current is not None:
+            self.source_snapshot.seed_vertex_positions(source_current)
+        if target_current is not None:
+            self.target_snapshot.seed_vertex_positions(target_current)
 
         if self.target_snapshot.vertex_count == 0:
             raise ConformError("Target mesh has no vertices")
@@ -183,6 +199,23 @@ class ConformSession:
     def free(self):
         self.source_snapshot.free()
         self.target_snapshot.free()
+
+    def write_target_positions(self, positions):
+        """把顶点坐标写回"用户正在编辑的那份":编辑模式下的活动形态键,否则网格本体。
+
+        写活动形态键时只动它一个键,别的键与网格本体分毫不动;活动键就是 Basis 时
+        网格顶点跟着一起走(Blender 自己也保持这两者一致)。
+        """
+        key_block = self.target_key_block
+        if key_block is None:
+            apply_vertex_positions(self.target_object, positions,
+                                   self.target_snapshot.vertex_positions)
+            return
+        mesh = self.target_object.data
+        write_shape_key_positions(key_block, positions)
+        if key_block == mesh.shape_keys.key_blocks[0]:
+            write_vertex_positions(mesh, positions)
+        mesh.update()
 
     # ==================== 匹配空间几何 ====================
 
@@ -936,7 +969,7 @@ class ConformSession:
             return f"Shape (shape key '{key_block.name}')"
 
         result = original + (mapped - original) * influence
-        apply_vertex_positions(self.target_object, result)
+        self.write_target_positions(result)
         return "Shape"
 
     def transfer_vertex_groups(self):
@@ -1215,7 +1248,7 @@ class ConformSession:
         mapped = transform_points(sampled, self._position_matrix)
         original = self.target_snapshot.vertex_positions
         result = original + (mapped - original) * influence
-        apply_vertex_positions(self.target_object, result)
+        self.write_target_positions(result)
         changed = int(np.count_nonzero(influence[:, 0] > 0.0))
         return f"{changed:,} vertices"
 
