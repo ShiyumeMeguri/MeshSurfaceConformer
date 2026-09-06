@@ -415,12 +415,43 @@ class MeshBufferSnapshot:
         return self._cached("loop_polygon_indices", build)
 
     @property
-    def corner_face_centers(self):
-        """每个 loop 所属面的中心坐标,(L, 3)。用于角点导向偏置采样。"""
+    def loop_triangle_indices(self):
+        """每个 loop 落在哪一个 loop 三角形上,(L,);三角化没覆盖到的角点为 -1。
+
+        一个角点同时属于同一张面的多个三角形时取其中之一 —— 它们同属一张面,
+        对"这个角点在哪张面上"的判定完全等价。
+        """
         def build():
-            centers = _read_floats(self.mesh.polygons, "center", 3)
-            return centers[self.loop_polygon_indices]
-        return self._cached("corner_face_centers", build)
+            table = np.full(self.loop_count, -1, dtype=np.int64)
+            triangle_loops = self.triangle_loop_indices
+            owners = np.repeat(
+                np.arange(triangle_loops.shape[0], dtype=np.int64), 3)
+            table[triangle_loops.ravel()] = owners
+            return table
+        return self._cached("loop_triangle_indices", build)
+
+    @property
+    def polygon_normals(self):
+        return self._cached(
+            "polygon_normals", lambda: _read_floats(self.mesh.polygons, "normal", 3))
+
+    @property
+    def corner_face_normals(self):
+        """每个 loop 所属面的面法线,(L, 3)。用于把贴在一起的两层按朝向分开。"""
+        return self._cached(
+            "corner_face_normals",
+            lambda: self.polygon_normals[self.loop_polygon_indices])
+
+    @property
+    def triangle_face_normals(self):
+        """每个 loop 三角形所属面的面法线,(T, 3)。
+
+        取所属面的法线而不是三角形自己的法线:一张翘曲的四边形拆出来的三角形可以指向
+        跟这张面本身差 90 度以上的方向,拿它判"这是不是贴在一起的另一层"会误判。
+        """
+        return self._cached(
+            "triangle_face_normals",
+            lambda: self.polygon_normals[self.triangle_polygon_indices])
 
     @property
     def corner_normals(self):

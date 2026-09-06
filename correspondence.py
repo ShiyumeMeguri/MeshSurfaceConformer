@@ -260,6 +260,43 @@ class SurfaceCorrespondence:
             bvh_positions.tolist(), bvh_triangles.tolist(), all_triangles=True)
         self._element_slots = {}
 
+    def settle_by_orientation(self, query_points, reference_normals, triangle_normals,
+                              triangle_indices, distances, tie_radii):
+        """把命中到"背对着的那一层"的行改判到朝向一致的同距候选上。
+
+        贴在一起的双层布料(两张面重合、法线相反、各用一座 UV 岛)在位置上完全分不开,
+        命中哪一张纯看 BVH 遍历顺序,必然采错一半;朝向才是能分开它们的判据。
+        只有朝向真的相反的行才重查,几何正常的网格一行都不会走这条路;
+        候选也只收"同距"的那些,隔着距离的另一片(头发卡片这种)绝不会被抢过去。
+        """
+        valid = triangle_indices >= 0
+        agreement = np.einsum(
+            'ij,ij->i', triangle_normals[np.where(valid, triangle_indices, 0)],
+            reference_normals)
+        ambiguous = np.nonzero(valid & (agreement < 0.0))[0]
+        if ambiguous.shape[0] == 0:
+            return triangle_indices, distances
+        settled_indices = triangle_indices.copy()
+        settled_distances = distances.copy()
+        find_range = self._bvh_tree.find_nearest_range
+        for row in ambiguous.tolist():
+            reference = reference_normals[row]
+            best_index = -1
+            best_distance = 0.0
+            best_agreement = 0.0
+            for _location, _normal, index, distance in find_range(
+                    query_points[row].tolist(), distances[row] + tie_radii[row]):
+                candidate = float(np.dot(triangle_normals[index], reference))
+                if candidate <= 0.0:
+                    continue
+                if best_index < 0 or distance < best_distance or (
+                        distance == best_distance and candidate > best_agreement):
+                    best_index, best_distance, best_agreement = index, distance, candidate
+            if best_index >= 0:
+                settled_indices[row] = best_index
+                settled_distances[row] = best_distance
+        return settled_indices, settled_distances
+
     def element_slots(self, domain, element_count):
         """源元素 → 含它的某个角在三角形数组里的扁平位置(slot//3 = 三角形, slot%3 = 角)。
 

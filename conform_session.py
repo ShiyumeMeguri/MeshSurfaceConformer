@@ -68,7 +68,7 @@ from .properties import resolved_corner_mapping, resolved_vertex_mapping
 # 与目标几何无关的映射(可在 Shape 写回后惰性构建)。
 _POSITION_INDEPENDENT_MAPPINGS = {'TOPOLOGY', 'MIRROR'}
 
-# 角点插值采样的导向偏置:角点值朝所属面的均值挪这么一点点来决定命中哪个面,
+# 角点插值采样的导向偏置:角点值朝所属三角形的重心挪这么一点点来决定命中哪个面,
 # 接缝两侧因此各落到正确的一侧;重心权重仍用真实角点值算,边界不内缩。
 _CORNER_SAMPLING_BIAS = 0.05
 
@@ -616,35 +616,57 @@ class ConformSession:
     def _corner_query_geometry(self, values=None):
         """(导向偏置查询点, 真实角点值),都在匹配空间。
 
-        偏置:角点值向所属面的平均值挪一点点来决定命中哪个面,接缝两侧各落到正确一侧;
+        偏置:角点值向所属三角形的重心挪一点点来决定命中哪个面,接缝两侧各落到正确一侧;
         重心权重再用真实角点值无钳计算,边界处线性外推不内缩。
-        values 为空 = 用顶点位置(基准就是形状时的老路径,面均值即多边形中心)。
+        朝三角形重心挪而不是朝多边形中心挪:三角形的重心必然在三角形内部,探针点因此
+        必然还落在这个角点自己的那片面上;多边形的顶点均值在非凸或翘曲的四边形上会落到
+        面外(实测本体网格上有这种四边形),探针一挪就跨过接缝落到邻面,那一侧的角点
+        整个被采成另一座 UV 岛。
+        values 为空 = 用顶点位置(基准就是形状时的老路径)。
         """
         target = self.target_snapshot
         if values is None:
             corner_values = target.vertex_positions[target.loop_vertex_indices]
-            face_means = target.corner_face_centers
             if self._is_world_space():
                 corner_values = transform_points(corner_values, self._target_matrix)
-                face_means = transform_points(face_means, self._target_matrix)
         else:
             corner_values = values
-            face_means = self._face_mean_of_corners(corner_values)
-        nudged = corner_values + (face_means - corner_values) * _CORNER_SAMPLING_BIAS
+        triangle_means = self._triangle_mean_of_corners(corner_values)
+        nudged = corner_values + (triangle_means - corner_values) * _CORNER_SAMPLING_BIAS
         return nudged, corner_values
 
-    def _face_mean_of_corners(self, corner_values):
-        """每个角点所属面的平均值 (L, C)(位置通道时等于多边形中心)。"""
+    def _settle_corner_hits_by_orientation(self, surface, nudged, corner_values,
+                                           triangle_indices, distances):
+        """几何空间的角点查询收尾:重合双层按面朝向定谁是谁。
+
+        只对 3D 表面查询成立 —— 别的基准空间(UV/权重/颜色)里没有"朝向"这回事。
+        同距的判据取导向偏置本身的长度:比自己那一挪还近的面就是"在同一处",
+        隔着距离的另一片(头发卡片这种)进不了候选。
+        """
+        reference_normals = self._match_space_target_normals(
+            self.target_snapshot.corner_face_normals)
+        triangle_normals = self._match_space_source_normals(
+            self.source_snapshot.triangle_face_normals)
+        tie_radii = np.linalg.norm(nudged - corner_values, axis=1)
+        return surface.settle_by_orientation(
+            nudged, reference_normals, triangle_normals, triangle_indices, distances,
+            tie_radii)
+
+    def _triangle_mean_of_corners(self, corner_values):
+        """每个角点所属三角形的三个角点均值 (L, C)。
+
+        三角化没覆盖到的角点(退化面)原样返回自己的值,即不做偏置。
+        """
         target = self.target_snapshot
-        face_indices = target.loop_polygon_indices
-        face_count = len(target.mesh.polygons)
-        counts = np.bincount(face_indices, minlength=face_count).astype(np.float64)
-        counts[counts == 0.0] = 1.0
-        sums = np.empty((face_count, corner_values.shape[1]), dtype=np.float64)
-        for channel in range(corner_values.shape[1]):
-            sums[:, channel] = np.bincount(
-                face_indices, weights=corner_values[:, channel], minlength=face_count)
-        return (sums / counts[:, None])[face_indices]
+        triangle_corners = target.triangle_loop_indices
+        if triangle_corners.shape[0] == 0:
+            return np.array(corner_values, dtype=np.float64, copy=True)
+        triangle_of_loop = target.loop_triangle_indices
+        covered = triangle_of_loop >= 0
+        means = corner_values[triangle_corners].mean(axis=1)
+        result = means[np.where(covered, triangle_of_loop, 0)]
+        result[~covered] = corner_values[~covered]
+        return result
 
     # ==================== 顶点域对应(Blender 顶点映射全集) ====================
 
@@ -846,15 +868,20 @@ class ConformSession:
         return DirectCornerCorrespondence(rows)
 
     def _build_corner_nearest_face_corner(self):
-        """NEAREST_POLY = Nearest Corner of Nearest Face:最近面上离角点最近的角。"""
+        """NEAREST_POLY = Nearest Corner of Nearest Face:最近面上离角点最近的角。
+
+        选面必须用导向偏置探针,不能拿裸顶点坐标去问:同一个顶点的所有角点坐标完全
+        相同,查出来的面也就完全相同,接缝两侧因此被采成同一个源角点 —— 目标上的
+        每一条 UV 接缝都会被焊死成一个坐标。选到面之后再拿真实角点位置挑最近的那个角。
+        """
         source = self.source_snapshot
         target = self.target_snapshot
         surface = self._get_surface_3d()
-        corner_points = target.vertex_positions[target.loop_vertex_indices]
-        if self._is_world_space():
-            corner_points = transform_points(corner_points, self._target_matrix)
+        nudged, corner_points = self._corner_query_geometry()
         triangle_indices, _hit_positions, distances = surface.query_nearest(
-            corner_points, self._search_max_distance())
+            nudged, self._search_max_distance())
+        triangle_indices, distances = self._settle_corner_hits_by_orientation(
+            surface, nudged, corner_points, triangle_indices, distances)
         valid = triangle_indices >= 0
         safe_triangles = np.where(valid, triangle_indices, 0)
         polygons = source.triangle_polygon_indices[safe_triangles]
@@ -889,6 +916,8 @@ class ConformSession:
         else:
             triangle_indices, _hit_positions, distances = surface.query_nearest(
                 nudged, self._search_max_distance())
+        triangle_indices, distances = self._settle_corner_hits_by_orientation(
+            surface, nudged, corner_positions, triangle_indices, distances)
         rows = surface.resolve(
             triangle_indices, corner_positions, distances, clamp_inside=False)
         return DirectCornerCorrespondence(rows)
