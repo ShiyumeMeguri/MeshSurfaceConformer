@@ -1050,10 +1050,14 @@ class ConformSession:
         return f"Vertex Groups ({len(kept_indices)})"
 
     def _lock_to_source_islands(self, correspondence, values, sampled):
-        """把每张目标面锁进同一座源岛,骑在接缝上的角点改判到最贴合那座岛上。
+        """把每张目标面锁进同一座源岛,骑在断处的角点改判到最贴合那座岛上。
 
-        岛是逐层算的:每层 UV 有自己的接缝,拿一层的岛去锁另一层必然错。所以这一步
-        挂在"搬这一层"里,而不是挂在全部通道共用的那份对应关系上。
+        一张目标面是一块连通的曲面,它的像也必须连通;角点各自独立解算会让一张面的
+        几个角落到断处两侧。UV 上表现为一条横穿图集的长边,法线上表现为一张面同时
+        吃了硬边两侧的朝向,颜色上表现为跨过色块边界的糊色。
+        "断在哪里"是逐份数据各不相同的:每层 UV 有自己的接缝,法线有自己的硬边,
+        每个颜色属性有自己的边界。所以这一步挂在"搬这一份"里,而不是挂在全部通道
+        共用的那份对应关系上 —— 拿一份的岛去锁另一份必然错。
         """
         source = self.source_snapshot
         target = self.target_snapshot
@@ -1146,6 +1150,7 @@ class ConformSession:
             self.warnings.append("Source has no color attributes to transfer")
             return None
         transferred_count = 0
+        locked_face_total = 0
         for attribute_name in attribute_names:
             payload = source.read_color_attribute(attribute_name)
             if payload is None:
@@ -1168,6 +1173,10 @@ class ConformSession:
                     f"'{domain}' — skipped")
                 continue
             sampled = correspondence.sample(values, domain)
+            if domain == 'CORNER':
+                sampled, locked_faces = self._lock_to_source_islands(
+                    correspondence, values, sampled)
+                locked_face_total += locked_faces
             attribute, recreated = ensure_color_attribute(
                 target_mesh, attribute_name, data_type, domain)
             if recreated:
@@ -1185,6 +1194,9 @@ class ConformSession:
             return None
         if target_mesh.color_attributes.active_color_index < 0:
             target_mesh.color_attributes.active_color_index = 0
+        if locked_face_total:
+            return (f"Colors ({transferred_count}, {locked_face_total:,} faces "
+                    f"snapped onto a single island)")
         return f"Colors ({transferred_count})"
 
     def transfer_corner_normals(self):
@@ -1194,7 +1206,11 @@ class ConformSession:
             return None
         correspondence = self.get_corner_correspondence()
         influence = self._corner_influence(correspondence)[:, None]
-        sampled = correspondence.sample(self.source_snapshot.corner_normals, CORNER)
+        source_normals = self.source_snapshot.corner_normals
+        sampled = correspondence.sample(source_normals, CORNER)
+        # 锁岛要在源自己的空间里做完:改判是"换成源上那个角点的值",换完再一起变换。
+        sampled, locked_faces = self._lock_to_source_islands(
+            correspondence, source_normals, sampled)
         if self._is_world_space():
             linear = self._position_matrix[:3, :3]
             try:
@@ -1207,6 +1223,8 @@ class ConformSession:
         blended = normalized_rows(
             existing + (sampled - existing) * influence, fallback=existing)
         write_corner_normals(self.target_object.data, blended)
+        if locked_faces:
+            return f"Custom Normals ({locked_faces:,} faces snapped onto one island)"
         return "Custom Normals"
 
     def _capture_evaluated_source_vertex_positions(self):
