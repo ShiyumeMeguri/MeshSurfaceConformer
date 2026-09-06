@@ -173,6 +173,10 @@ class GatherCorrespondence:
         data = self._bridge.to_domain(data, domain, self.index_domain)
         return np.einsum('nkc,nk->nc', data[self._indices], self._weights)
 
+    def dominant_corners(self):
+        rows = np.arange(self._weights.shape[0], dtype=np.int64)
+        return self._indices[rows, np.argmax(self._weights, axis=1)]
+
 
 class CorrespondenceRows:
     """一次三角形命中查询的逐行结果:命中三角形 + 重心权重,可对任意源数据插值采样。"""
@@ -224,6 +228,12 @@ class CorrespondenceRows:
         distances = self.distances.copy()
         distances[target_rows] = 0.0
         return CorrespondenceRows(valid, triangles, weights, distances, self._owner)
+
+    def dominant_corners(self):
+        """每个目标角点权重最大的那个源角点(loop)索引。"""
+        rows = np.arange(self._weights.shape[0], dtype=np.int64)
+        slots = np.argmax(self._weights, axis=1)
+        return self._owner.triangle_corner_indices[self._triangle_indices][rows, slots]
 
     def as_nearest(self):
         """把重心权重塌成命中三角形里最近那个角的 one-hot。
@@ -365,6 +375,162 @@ class SurfaceCorrespondence:
         return CorrespondenceRows(valid, safe_indices, weights, distances, self)
 
 
+# ==================== 源岛(角点通道的连通分量) ====================
+
+def connected_component_labels(left_nodes, right_nodes, node_count):
+    """连通分量标号,返回逐节点的代表元(每个分量取其中最小的节点号)。
+
+    经典的"取邻居最小 + 指针跳跃"迭代,全程 numpy:边按起点排一次序,之后每一轮
+    只是一次 gather 加一次 reduceat。并查集那种逐边 Python 循环在几万条边上要几百毫秒,
+    这里几轮就收敛,而且没有 ufunc.at 那类慢路径。
+    """
+    labels = np.arange(node_count, dtype=np.int64)
+    if left_nodes.shape[0] == 0:
+        return labels
+    sources = np.concatenate((left_nodes, right_nodes))
+    targets = np.concatenate((right_nodes, left_nodes))
+    order = np.argsort(sources, kind='stable')
+    sources = sources[order]
+    targets = targets[order]
+    counts = np.bincount(sources, minlength=node_count)
+    present = np.nonzero(counts > 0)[0]
+    starts = np.concatenate((np.zeros(1, dtype=np.int64), np.cumsum(counts)))[present]
+    every_node_has_an_edge = present.shape[0] == node_count
+
+    while True:
+        neighbour_minimum = np.minimum.reduceat(labels[targets], starts)
+        if every_node_has_an_edge:
+            candidate = np.minimum(labels, neighbour_minimum)
+        else:
+            candidate = labels.copy()
+            candidate[present] = np.minimum(candidate[present], neighbour_minimum)
+        while True:
+            jumped = candidate[candidate]
+            if np.array_equal(jumped, candidate):
+                break
+            candidate = jumped
+        if np.array_equal(candidate, labels):
+            return labels
+        labels = candidate
+
+
+def corner_island_labels(loop_starts, loop_totals, loop_vertex_indices, values):
+    """角点通道的"岛"标号:同一张面的角点连通,同一顶点上取值相同的角点也连通。
+
+    UV 的接缝就是这张连通图上被剪开的地方,所以岛是**逐层**的 —— 每层 UV 有自己的接缝,
+    颜色属性有自己的断点。拿一层的岛去锁另一层必然错。
+    """
+    loop_count = loop_vertex_indices.shape[0]
+    if loop_count == 0:
+        return np.empty(0, dtype=np.int64)
+    face_of_loop = np.repeat(
+        np.arange(loop_starts.shape[0], dtype=np.int64), loop_totals)
+    within_face_left = loop_starts[face_of_loop]
+    within_face_right = np.arange(loop_count, dtype=np.int64)
+
+    magnitude = float(np.max(np.abs(values))) if values.size else 1.0
+    step = 16777216.0 / max(magnitude, 1.0)
+    quantized = np.round(values * step).astype(np.int64)
+    # 只需要知道"同一顶点上的哪几个角点取值相同",不需要给取值编全局号:
+    # 按 (顶点, 取值) 排一次序比相邻行即可,省掉 unique(axis=0) 那条慢路径。
+    keys = [quantized[:, column] for column in range(quantized.shape[1] - 1, -1, -1)]
+    order = np.lexsort(tuple(keys) + (loop_vertex_indices,))
+    sorted_values = quantized[order]
+    same = ((loop_vertex_indices[order][1:] == loop_vertex_indices[order][:-1])
+            & (sorted_values[1:] == sorted_values[:-1]).all(axis=1))
+    shared_left = order[:-1][same]
+    shared_right = order[1:][same]
+
+    return connected_component_labels(
+        np.concatenate((within_face_left, shared_left)),
+        np.concatenate((within_face_right, shared_right)),
+        loop_count)
+
+
+def lock_faces_to_islands(island_of_source_corner, source_corner_positions,
+                          target_corner_positions, target_face_of_corner,
+                          chosen_source_corners, valid):
+    """把每张目标面整张锁进同一座源岛,返回改判后的"每个目标角点取自哪个源角点"。
+
+    一张目标面是一块连通的曲面,它的像也必须连通。角点各自独立解算时,一张骑在源接缝上
+    的面会让几个角落到接缝两侧,UV 上就是一条横穿整张图集的长边 —— 模型上看就是一片
+    乱掉的三角形。这里按"整张面贴哪座岛最紧"(各角点到该岛最近点的距离之和最小)选定
+    一座岛,再把不在这座岛上的角点改判到该岛离它最近的角点。
+    只改真的骑在两座岛上的面,别的面一个角点都不动。
+    """
+    result = np.array(chosen_source_corners, dtype=np.int64, copy=True)
+    usable = np.nonzero(valid)[0]
+    if usable.shape[0] == 0:
+        return result, 0
+    islands_per_corner = island_of_source_corner[chosen_source_corners]
+    faces = target_face_of_corner[usable]
+    face_count = int(target_face_of_corner.max()) + 1
+
+    # 哪些面骑在两座岛上:按 (面, 岛) 排一次序数不同的组即可,全程向量化,
+    # 不必为了做这个判断把七千多张面逐张走一遍 Python。
+    order = np.lexsort((islands_per_corner[usable], faces))
+    sorted_faces = faces[order]
+    sorted_islands = islands_per_corner[usable][order]
+    group_start = np.empty(order.shape[0], dtype=bool)
+    group_start[0] = True
+    group_start[1:] = ((sorted_faces[1:] != sorted_faces[:-1])
+                       | (sorted_islands[1:] != sorted_islands[:-1]))
+    distinct_islands = np.bincount(sorted_faces[group_start], minlength=face_count)
+    straddling = np.nonzero(distinct_islands > 1)[0]
+    if straddling.shape[0] == 0:
+        return result, 0
+
+    corner_order = usable[np.argsort(faces, kind='stable')]
+    corners_per_face = np.bincount(faces, minlength=face_count)
+    face_offsets = np.concatenate(
+        (np.zeros(1, dtype=np.int64), np.cumsum(corners_per_face)))
+
+    island_trees = {}
+    island_members = {}
+
+    def tree_for(island):
+        if island not in island_trees:
+            members = np.nonzero(island_of_source_corner == island)[0]
+            tree = KDTree(members.shape[0])
+            insert = tree.insert
+            for slot, member in enumerate(members.tolist()):
+                insert(source_corner_positions[member].tolist(), slot)
+            tree.balance()
+            island_members[island] = members
+            island_trees[island] = tree
+        return island_trees[island]
+
+    locked_faces = 0
+    for face in straddling.tolist():
+        corners = corner_order[face_offsets[face]:face_offsets[face + 1]]
+        candidates = np.unique(islands_per_corner[corners])
+        locked_faces += 1
+        best_island = -1
+        best_cost = None
+        best_choice = None
+        for island in candidates.tolist():
+            tree = tree_for(island)
+            members = island_members[island]
+            cost = 0.0
+            choice = []
+            for corner in corners.tolist():
+                _location, slot, distance = tree.find(
+                    target_corner_positions[corner].tolist())
+                if slot is None:
+                    cost = None
+                    break
+                cost += distance
+                choice.append(members[slot])
+            if cost is None:
+                continue
+            if best_cost is None or cost < best_cost:
+                best_cost, best_island, best_choice = cost, island, choice
+        if best_island < 0:
+            continue
+        for corner, member in zip(corners.tolist(), best_choice):
+            if islands_per_corner[corner] != best_island:
+                result[corner] = member
+    return result, locked_faces
 def build_kd_tree(positions):
     """mathutils KDTree 构建(最近顶点系映射用)。"""
     kd_tree = KDTree(positions.shape[0])
@@ -485,19 +651,26 @@ class DirectCornerCorrespondence:
             return self._rows.sample_vertex_data(data)
         return self._rows.sample_corner_data(data)
 
+    def dominant_corners(self):
+        return self._rows.dominant_corners()
+
 
 class TopologyCornerCorrespondence:
     """拓扑直通的角点域对应:loop 数一致时的逐序号拷贝。"""
 
-    __slots__ = ("valid", "distances", "_bridge")
+    __slots__ = ("valid", "distances", "_bridge", "_loop_count")
 
     def __init__(self, loop_count, bridge):
         self.valid = np.ones(loop_count, dtype=bool)
         self.distances = np.zeros(loop_count, dtype=np.float64)
         self._bridge = bridge
+        self._loop_count = loop_count
 
     def sample(self, data, domain=CORNER):
         return self._bridge.to_domain(data, domain, CORNER).copy()
+
+    def dominant_corners(self):
+        return np.arange(self._loop_count, dtype=np.int64)
 
 
 def match_corners_by_face_values(source_values, source_loop_starts, source_loop_totals,

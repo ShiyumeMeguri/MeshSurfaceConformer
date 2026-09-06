@@ -30,8 +30,10 @@ from .correspondence import (
     TopologyVertexCorrespondence,
     DirectCornerCorrespondence,
     TopologyCornerCorrespondence,
+    corner_island_labels,
     deduplicate_queries,
     exact_value_groups,
+    lock_faces_to_islands,
     match_corners_by_face_values,
     snap_positions_to_nearest,
     build_kd_tree,
@@ -1047,6 +1049,33 @@ class ConformSession:
             write_vertex_group_weights(self.target_object, group_name, blended)
         return f"Vertex Groups ({len(kept_indices)})"
 
+    def _lock_to_source_islands(self, correspondence, values, sampled):
+        """把每张目标面锁进同一座源岛,骑在接缝上的角点改判到最贴合那座岛上。
+
+        岛是逐层算的:每层 UV 有自己的接缝,拿一层的岛去锁另一层必然错。所以这一步
+        挂在"搬这一层"里,而不是挂在全部通道共用的那份对应关系上。
+        """
+        source = self.source_snapshot
+        target = self.target_snapshot
+        islands = corner_island_labels(
+            source.polygon_loop_starts, source.polygon_loop_totals,
+            source.loop_vertex_indices, values)
+        source_positions = source.vertex_positions[source.loop_vertex_indices]
+        target_positions = target.vertex_positions[target.loop_vertex_indices]
+        if self._is_world_space():
+            source_positions = transform_points(source_positions, self._source_matrix)
+            target_positions = transform_points(target_positions, self._target_matrix)
+        chosen_corners = correspondence.dominant_corners()
+        locked_corners, locked_faces = lock_faces_to_islands(
+            islands, source_positions, target_positions,
+            target.loop_polygon_indices, chosen_corners, correspondence.valid)
+        if locked_faces == 0:
+            return sampled, 0
+        moved = locked_corners != chosen_corners
+        result = np.array(sampled, dtype=np.float64, copy=True)
+        result[moved] = values[locked_corners[moved]]
+        return result, locked_faces
+
     def _resolve_uv_target_name(self, source_layer_name, transferring_all):
         settings = self.settings
         if settings.uv_write_mode == 'ACTIVE' and not transferring_all:
@@ -1075,11 +1104,14 @@ class ConformSession:
         correspondence = self.get_corner_correspondence()
         influence = self._corner_influence(correspondence)[:, None]
         written_names = []
+        locked_face_total = 0
         for layer_name in layer_names:
             source_uv = source.read_uv_layer(layer_name)
             if source_uv is None:
                 continue
-            sampled = correspondence.sample(source_uv, CORNER)
+            sampled, locked_faces = self._lock_to_source_islands(
+                correspondence, source_uv, correspondence.sample(source_uv, CORNER))
+            locked_face_total += locked_faces
             target_name, force_new = self._resolve_uv_target_name(
                 layer_name, settings.uv_transfer_all)
             if force_new:
@@ -1096,6 +1128,9 @@ class ConformSession:
             written_names.append(actual_name)
         if not written_names:
             return None
+        if locked_face_total:
+            return (f"UVs ({len(written_names)}, {locked_face_total:,} faces "
+                    f"snapped onto a single UV island)")
         return f"UVs ({len(written_names)})"
 
     def transfer_color_attributes(self):
