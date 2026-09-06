@@ -366,12 +366,49 @@ class SurfaceCorrespondence:
 
         weight_points: 用于计算重心权重的点。
             顶点域传命中点(权重必然在三角形内);
-            角点域传"真实角点"(配合导向偏置查询实现接缝正确 + 边界外推精确)。
+            角点域传"真实角点"(配合导向偏置查询实现接缝正确)。
         """
         valid = triangle_indices >= 0
         safe_indices = np.where(valid, triangle_indices, 0)
         corners = self._triangle_corner_positions[safe_indices]
         weights = compute_barycentric_weights(weight_points, corners, clamp_inside)
+        return CorrespondenceRows(valid, safe_indices, weights, distances, self)
+
+    def resolve_at_surface(self, triangle_indices, corner_points, distances,
+                           open_boundary_edges):
+        """角点域解析:一律取三角形上的最近点,只有源表面真的到头的地方才外推。
+
+        横向外推是有代价的:目标角点一旦不是恰好落在源面上(抽面出来的 LOD、
+        不同拓扑的变体),拿它相对三角形的重心去线性延拓会把 UV 甩到图集外面 ——
+        实测抽面到 0.9 时最远甩到 3.82,而正确取值全在 0..1 内。
+        真正需要延拓的只有一种情形:源表面在这里就结束了(开放边界),目标却还往外
+        伸出去一点。那时钳死会把整圈边界压成一条零面积的带子,延拓才是对的。
+        所以判据是"最近点落在的那条边是不是源的开放边界",而不是一个外推幅度上限。
+        """
+        valid = triangle_indices >= 0
+        safe_indices = np.where(valid, triangle_indices, 0)
+        corners = self._triangle_corner_positions[safe_indices]
+
+        normals = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+        lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+        unit = np.divide(normals, lengths, out=np.zeros_like(normals),
+                         where=lengths > 1e-20)
+        elevation = np.einsum('ij,ij->i', corner_points - corners[:, 0], unit)
+        projected = corner_points - unit * elevation[:, None]
+
+        clamped = compute_barycentric_weights(projected, corners, True)
+        # 被钳掉的那几个分量为零,说明最近点落在"正对着它们"的那条边上。
+        on_edge = clamped <= 1e-12
+        outward_allowed = on_edge & open_boundary_edges[safe_indices]
+        if not np.any(outward_allowed):
+            return CorrespondenceRows(valid, safe_indices, clamped, distances, self)
+
+        # 延拓只保留"垂直于边界边往外"的那一份:沿着边界方向的位置仍取钳住的结果。
+        # 目标角点在源面上横向挪开(抽面出来的 LOD 必然如此)属于沿边方向,
+        # 让它参与线性延拓就会把取值甩到图集外面去 —— 实测最远甩到 3.82。
+        free = compute_barycentric_weights(corner_points, corners, False)
+        outward = np.where(outward_allowed, np.minimum(free, 0.0), 0.0)
+        weights = clamped * (1.0 - outward.sum(axis=1))[:, None] + outward
         return CorrespondenceRows(valid, safe_indices, weights, distances, self)
 
 

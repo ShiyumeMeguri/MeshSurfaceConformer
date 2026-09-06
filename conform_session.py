@@ -847,8 +847,9 @@ class ConformSession:
             nudged, exact_values = self._corner_query_geometry(corner_values)
             triangle_indices, _hit_positions, distances = surface.query_nearest(
                 nudged, max_distance)
-            rows = surface.resolve(
-                triangle_indices, exact_values, distances, clamp_inside=False)
+            rows = surface.resolve_at_surface(
+                triangle_indices, exact_values, distances,
+                self.source_snapshot.triangle_open_boundary_edges)
             self._warn_if_basis_far(kind, distances, rows.valid, extent,
                                     self._target_selection_mask(CORNER))
             rows = self._apply_exact_basis_matches(
@@ -858,8 +859,9 @@ class ConformSession:
             queries = values[first_indices]
             triangle_indices, _hit_positions, distances = surface.query_nearest(
                 queries, max_distance)
-            rows = surface.resolve(
-                triangle_indices, queries, distances, clamp_inside=False)
+            rows = surface.resolve_at_surface(
+                triangle_indices, queries, distances,
+                self.source_snapshot.triangle_open_boundary_edges)
             self._warn_if_basis_far(
                 kind, distances, rows.valid, extent,
                 self._target_selection_mask(CORNER, first_indices))
@@ -920,8 +922,9 @@ class ConformSession:
                 nudged, self._search_max_distance())
         triangle_indices, distances = self._settle_corner_hits_by_orientation(
             surface, nudged, corner_positions, triangle_indices, distances)
-        rows = surface.resolve(
-            triangle_indices, corner_positions, distances, clamp_inside=False)
+        rows = surface.resolve_at_surface(
+            triangle_indices, corner_positions, distances,
+            self.source_snapshot.triangle_open_boundary_edges)
         return DirectCornerCorrespondence(rows)
 
     # ==================== 影响权重管线 ====================

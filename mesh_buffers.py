@@ -394,6 +394,48 @@ class MeshBufferSnapshot:
         return self._cached("loop_triangles", self._build_loop_triangles)[2]
 
     @property
+    def triangle_open_boundary_edges(self):
+        """每个 loop 三角形的三条边里,哪一条是网格的开放边界,(T, 3) bool。
+        第 k 列对应"正对着第 k 个角"的那条边(即另外两个角连成的边)。
+
+        只有"多边形自己的边"才可能是网格边:多边形三角化切出来的对角线不是网格边,
+        自然也不是边界。开放边界 = 只有一张面用到的网格边。
+        """
+        def build():
+            loop_vertices = self.loop_vertex_indices
+            loop_count = loop_vertices.shape[0]
+            starts = self.polygon_loop_starts
+            totals = self.polygon_loop_totals
+            face_of_loop = self.loop_polygon_indices
+            within = np.arange(loop_count, dtype=np.int64) - starts[face_of_loop]
+            next_loop = starts[face_of_loop] + (within + 1) % totals[face_of_loop]
+
+            pairs = np.stack(
+                (np.minimum(loop_vertices, loop_vertices[next_loop]),
+                 np.maximum(loop_vertices, loop_vertices[next_loop])), axis=1)
+            _unique, edge_of_loop, face_counts = np.unique(
+                pairs, axis=0, return_inverse=True, return_counts=True)
+            edge_of_loop = edge_of_loop.reshape(-1)
+            open_edge = face_counts == 1
+
+            triangle_loops = self.triangle_loop_indices
+            triangle_count = triangle_loops.shape[0]
+            result = np.zeros((triangle_count, 3), dtype=bool)
+            offsets = within[triangle_loops]
+            sizes = totals[face_of_loop[triangle_loops[:, 0]]][:, None]
+            for corner in range(3):
+                first = (corner + 1) % 3
+                second = (corner + 2) % 3
+                forward = (offsets[:, first] + 1) % sizes[:, 0] == offsets[:, second]
+                backward = (offsets[:, second] + 1) % sizes[:, 0] == offsets[:, first]
+                along = np.where(forward, triangle_loops[:, first],
+                                 triangle_loops[:, second])
+                # 只有相邻的两个角才构成多边形自己的边,对角线不算。
+                result[:, corner] = (forward | backward) & open_edge[edge_of_loop[along]]
+            return result
+        return self._cached("triangle_open_boundary_edges", build)
+
+    @property
     def polygon_loop_starts(self):
         return self._cached(
             "polygon_loop_starts", lambda: _read_ints(self.mesh.polygons, "loop_start", 1))
