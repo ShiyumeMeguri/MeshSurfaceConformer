@@ -221,8 +221,10 @@ class MeshSurfaceConformerSettings(PropertyGroup):
     )
     shape_as_shape_key: BoolProperty(
         name="As Shape Key",
-        description="Write the conformed positions into a shape key instead of "
-                    "moving the mesh — the original shape stays recoverable",
+        description="Write the conformed positions into a new shape key instead of "
+                    "moving the mesh — the original shape stays recoverable. Only "
+                    "for meshes without shape keys: a mesh that already has them is "
+                    "always moved in place, its Basis and every key shifting together",
         default=True,
     )
     snap_shape_to_vertices: BoolProperty(

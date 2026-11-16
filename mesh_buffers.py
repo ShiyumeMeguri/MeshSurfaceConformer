@@ -183,18 +183,6 @@ def apply_vertex_positions(target_object, positions, reference_positions):
         mesh, read_shape_key_positions(key_blocks[0], vertex_count))
 
 
-def active_shape_key_block(mesh_object):
-    """用户此刻正在编辑的那个形态键;没有形态键或索引越界返回 None。"""
-    shape_keys = mesh_object.data.shape_keys
-    if shape_keys is None:
-        return None
-    key_blocks = shape_keys.key_blocks
-    index = mesh_object.active_shape_key_index
-    if 0 <= index < len(key_blocks):
-        return key_blocks[index]
-    return None
-
-
 def ensure_shape_key(target_object, shape_key_name):
     """确保目标对象存在 Basis 与指定形态键。返回 (key_block, created)。
     新建键的初始坐标 = 当前基础网格(from_mix=False)。"""
@@ -218,16 +206,19 @@ def read_shape_key_mix_positions(mesh_object):
 
     借 Blender 自己的 from_mix 求值,不重实现相对形态键/相对键/顶点组遮罩那一套。
     会短暂增删一个形态键,所以必须在持有任何求值网格之前调用,也因此只能在可编辑数据上做。
+    删键会把活动形态键索引减一,事后原样还原,不能让用户正在用的那个键悄悄换掉。
     没有形态键、或数据是链接进来的库数据,一律返回 None(调用方据此退回静止态)。
     """
     mesh = mesh_object.data
     if mesh.shape_keys is None or not is_editable(mesh):
         return None
+    active_index = mesh_object.active_shape_key_index
     temporary = mesh_object.shape_key_add(name="__conformer_mix__", from_mix=True)
     try:
         return read_shape_key_positions(temporary, len(mesh.vertices))
     finally:
         mesh_object.shape_key_remove(temporary)
+        mesh_object.active_shape_key_index = active_index
 
 
 def add_numbered_shape_key(target_object, base_name):

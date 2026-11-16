@@ -43,11 +43,9 @@ from .correspondence import (
 )
 from .mesh_buffers import (
     MeshBufferSnapshot,
-    active_shape_key_block,
     add_numbered_shape_key,
     add_numbered_uv_layer,
     apply_vertex_positions,
-    write_vertex_positions,
     read_shape_key_mix_positions,
     matrix_to_numpy,
     transform_points,
@@ -119,8 +117,7 @@ def mirror_matrix(axis):
 
 
 class ConformSession:
-    def __init__(self, context, settings, source_object, target_object, mirror=None,
-                 in_edit_mode=False):
+    def __init__(self, context, settings, source_object, target_object, mirror=None):
         self._context = context
         self.settings = settings
         self.source_object = source_object
@@ -136,20 +133,12 @@ class ConformSession:
         # 精确且不需要任何空间查询,所以强制走拓扑映射。
         self.same_object = source_object == target_object
 
-        # 编辑模式下用户看到、也正在改的是活动形态键本身(不是形态键混合结果),
-        # 所以读它、写也写回它 —— 动的就是你正在编辑的那份坐标。
-        self.target_key_block = (
-            active_shape_key_block(target_object) if in_edit_mode else None)
-
-        # 两边都按"当前可见形状"(形态键混合后)参与匹配:源上调了形态键就该按调完的
-        # 形状搬运,目标则接着上一次的结果继续推进,而不是每次都从静止态重来。
+        # 两边都按"当前可见形状"(形态键混合后)参与匹配,与物体模式还是编辑模式、
+        # 活动的是哪个形态键无关:源上调了形态键就该按调完的形状搬运,目标则接着
+        # 上一次的结果继续推进,而不是每次都从静止态(Basis)重来。
         # 求值源自带形态键与修改器,不用也不能再叠这一层(顶点数已经变了)。
         # 混合取值会短暂增删一个形态键,必须赶在源求值网格建立之前做完。
-        if self.target_key_block is not None:
-            target_current = read_shape_key_positions(
-                self.target_key_block, len(target_object.data.vertices))
-        else:
-            target_current = self._current_shape_positions(target_object)
+        target_current = self._current_shape_positions(target_object)
         if settings.use_evaluated_source:
             source_current = None
         elif self.same_object:
@@ -220,21 +209,9 @@ class ConformSession:
         self.target_snapshot.free()
 
     def write_target_positions(self, positions):
-        """把顶点坐标写回"用户正在编辑的那份":编辑模式下的活动形态键,否则网格本体。
-
-        写活动形态键时只动它一个键,别的键与网格本体分毫不动;活动键就是 Basis 时
-        网格顶点跟着一起走(Blender 自己也保持这两者一致)。
-        """
-        key_block = self.target_key_block
-        if key_block is None:
-            apply_vertex_positions(self.target_object, positions,
-                                   self.target_snapshot.vertex_positions)
-            return
-        mesh = self.target_object.data
-        write_shape_key_positions(key_block, positions)
-        if key_block == mesh.shape_keys.key_blocks[0]:
-            write_vertex_positions(mesh, positions)
-        mesh.update()
+        """把顶点坐标写回目标:带形态键时 Basis 与每个键整体平移同一段位移(见 apply_vertex_positions)。"""
+        apply_vertex_positions(self.target_object, positions,
+                               self.target_snapshot.vertex_positions)
 
     # ==================== 匹配空间几何 ====================
 
@@ -1002,26 +979,23 @@ class ConformSession:
         self._warn_if_collapsed(original[correspondence.valid],
                                 mapped[correspondence.valid])
 
-        if settings.shape_as_shape_key:
-            current = original
-            result = current + (mapped - current) * influence
-            mesh = self.target_object.data
-            if mesh.shape_keys is None:
-                self.target_object.shape_key_add(name="Basis", from_mix=False)
-            basis_positions = read_shape_key_positions(
-                mesh.shape_keys.key_blocks[0], self.target_snapshot.vertex_count)
+        result = original + (mapped - original) * influence
+        mesh = self.target_object.data
+        if settings.shape_as_shape_key and mesh.shape_keys is None:
+            # 目标还没有形态键:Basis 就是 original,新键存结果本身,权重 1 时可见形状即结果。
             key_block = add_numbered_shape_key(
                 self.target_object, f"{self.source_object.name}.Conformed")
-            # 相对形态键是叠加的:存"相对当前可见形状的修正量",加上去正好得到目标形状,
-            # 已有形态键的值一个都不用动,再应用一次就在这一层之上继续推进。
-            write_shape_key_positions(key_block, basis_positions + (result - current))
+            write_shape_key_positions(key_block, result)
             key_block.value = 1.0
-            self.target_object.data.update()
+            mesh.update()
             return f"Shape (shape key '{key_block.name}')"
 
-        result = original + (mapped - original) * influence
+        # 已经带形态键的目标不另建一层:Basis 与每个键一起平移,当前权重下的混合结果即 result。
         self.write_target_positions(result)
-        return "Shape"
+        shape_key_count = 0 if mesh.shape_keys is None else len(mesh.shape_keys.key_blocks) - 1
+        if shape_key_count == 0:
+            return "Shape"
+        return f"Shape (Basis and {shape_key_count} shape keys moved together)"
 
     def transfer_vertex_groups(self):
         settings = self.settings
