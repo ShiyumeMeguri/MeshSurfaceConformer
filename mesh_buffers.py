@@ -183,6 +183,18 @@ def apply_vertex_positions(target_object, positions, reference_positions):
         mesh, read_shape_key_positions(key_blocks[0], vertex_count))
 
 
+def active_shape_key_block(mesh_object):
+    """用户此刻正在编辑的那个形态键;没有形态键或索引越界返回 None。"""
+    shape_keys = mesh_object.data.shape_keys
+    if shape_keys is None:
+        return None
+    key_blocks = shape_keys.key_blocks
+    index = mesh_object.active_shape_key_index
+    if 0 <= index < len(key_blocks):
+        return key_blocks[index]
+    return None
+
+
 def ensure_shape_key(target_object, shape_key_name):
     """确保目标对象存在 Basis 与指定形态键。返回 (key_block, created)。
     新建键的初始坐标 = 当前基础网格(from_mix=False)。"""

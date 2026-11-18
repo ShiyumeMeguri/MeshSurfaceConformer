@@ -246,7 +246,7 @@ class VIEW3D_PT_mesh_surface_conformer_data(ConformerPanelMixin, Panel):
         layout.use_property_split = True
         layout.use_property_decorate = False
         settings = self.settings_of(context)
-        source, target = gather_source_and_target(context)
+        source, _target = gather_source_and_target(context)
         drawn = False
 
         if settings.use_shape:
@@ -254,9 +254,6 @@ class VIEW3D_PT_mesh_surface_conformer_data(ConformerPanelMixin, Panel):
             column = layout.column(heading="Shape")
             column.prop(settings, "shape_as_shape_key")
             column.prop(settings, "snap_shape_to_vertices")
-            if target is not None and target.data.shape_keys is not None:
-                column.label(text="Target has shape keys: Basis and every key move together",
-                             icon='INFO')
 
         if settings.use_shape_keys:
             drawn = True
